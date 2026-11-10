@@ -29,12 +29,14 @@ import threading
 import numpy as np
 from datetime import datetime
 from collections import deque
+from typing import Optional, Dict, List, Tuple, Any
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
-# Default ROS 2 domain if not set
+# Default ROS 2 domain and FastDDS Shared Memory RMW (bypasses 212KB UDP rmem_max for 3MB RGB & PointCloud2)
 if "ROS_DOMAIN_ID" not in os.environ:
     os.environ["ROS_DOMAIN_ID"] = "0"
+os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
 
 # PyQt5 / PyQt6 imports
 try:
@@ -43,7 +45,8 @@ try:
                                  QStatusBar, QProgressBar, QMessageBox, QInputDialog,
                                  QFrame, QSplitter, QDialog, QSlider, QCheckBox, QFormLayout,
                                  QButtonGroup, QRadioButton, QGroupBox, QTabWidget,
-                                 QDoubleSpinBox, QSpinBox, QSizeGrip)
+                                 QDoubleSpinBox, QSpinBox, QSizeGrip, QStackedWidget,
+                                 QListWidget, QListWidgetItem)
     from PyQt6.QtCore import QProcess, QTimer, Qt, QThread, pyqtSignal, QPointF, QPoint, QRect, QRectF
     from PyQt6.QtGui import (QFont, QPalette, QColor, QPainter, QPen, QBrush, QPolygonF,
                              QPolygon, QImage, QPixmap, QIcon, QLinearGradient, QRadialGradient, QPainterPath)
@@ -53,7 +56,8 @@ except ImportError:
                                  QStatusBar, QProgressBar, QMessageBox, QInputDialog,
                                  QFrame, QSplitter, QDialog, QSlider, QCheckBox, QFormLayout,
                                  QButtonGroup, QRadioButton, QGroupBox, QTabWidget,
-                                 QDoubleSpinBox, QSpinBox, QSizeGrip)
+                                 QDoubleSpinBox, QSpinBox, QSizeGrip, QStackedWidget,
+                                 QListWidget, QListWidgetItem)
     from PyQt5.QtCore import QProcess, QTimer, Qt, QThread, pyqtSignal, QPointF, QPoint, QRect, QRectF
     from PyQt5.QtGui import (QFont, QPalette, QColor, QPainter, QPen, QBrush, QPolygonF,
                              QPolygon, QImage, QPixmap, QIcon, QLinearGradient, QRadialGradient, QPainterPath)
@@ -63,6 +67,7 @@ except ImportError:
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
     from sensor_msgs.msg import Image, PointCloud2, Imu, NavSatFix, CameraInfo
     from nav_msgs.msg import Odometry
@@ -71,6 +76,7 @@ try:
     HAS_ROS2 = True
 except ImportError:
     rclpy = None
+    SingleThreadedExecutor = None
     CvBridge = None
     HAS_ROS2 = False
 
@@ -111,13 +117,14 @@ except ImportError:
 
 
 # ==============================================================================
-# RIGID EXTRINSICS & GEOMETRIC TRANSFORMS (ACTIVE 45-DEG PRODUCTION PROFILE)
+# RIGID EXTRINSICS & GEOMETRIC TRANSFORMS (AUTHORITATIVE PRODUCTION PROFILE)
 # ==============================================================================
 try:
     import yaml as _yaml
 except ImportError:
     _yaml = None
 
+# Default Fallbacks:
 # 1. IMU from LiDAR Frame (Factory DIFOP Calibration & robosense.yaml)
 R_IMU_LIDAR = np.array([
     [ 0.012366, -0.999888,  0.008426],
@@ -126,21 +133,39 @@ R_IMU_LIDAR = np.array([
 ], dtype=np.float64)
 t_IMU_LIDAR = np.array([0.004164, 0.004315, -0.004411], dtype=np.float64)
 
-# 2. Camera Depth Optical Frame (Left IR) from LiDAR Frame (scanarV4_45deg)
-R_CAM_LIDAR = np.array([
-    [-0.999975,  0.008047,  0.001545],
-    [-0.004515, -0.698495,  0.715601],
-    [ 0.006838,  0.715576,  0.698514]
+# 2. Camera Depth Optical Frame (Left IR) from IMU Frame (production_extrinsics.yaml active_transforms.T_cam0_airy_imu)
+# p_cam0 = T_cam0_airy_imu * p_imu
+R_CAM_IMU = np.array([
+    [ 0.999944, -0.003490, -0.010008],
+    [ 0.004480, -0.716562,  0.697509],
+    [-0.009605, -0.697515, -0.716506]
 ], dtype=np.float64)
-t_CAM_LIDAR = np.array([0.043475, -0.050779, -0.029993], dtype=np.float64)
+t_CAM_IMU = np.array([0.039251, -0.056910, -0.030089], dtype=np.float64)
 
-# 5. RGB Optical Frame from Camera Depth Optical Frame (Factory EEPROM T_rgb_depth)
+# Inverse: IMU from Camera Depth Optical Frame
+# p_imu = R_CAM_IMU.T @ (p_cam0 - t_CAM_IMU) = R_CAM_IMU.T @ p_cam0 - R_CAM_IMU.T @ t_CAM_IMU
+R_IMU_CAM_DEPTH = R_CAM_IMU.T
+t_IMU_CAM_DEPTH = -R_CAM_IMU.T @ t_CAM_IMU
+
+# 3. RGB Optical Frame from IMU Frame (production_extrinsics.yaml active_transforms.T_rgb_airy_imu)
+# p_rgb = T_rgb_airy_imu * p_imu
+R_RGB_IMU = np.array([
+    [ 0.999936, -0.002759, -0.010962],
+    [ 0.005675, -0.716106,  0.697968],
+    [-0.009776, -0.697985, -0.716045]
+], dtype=np.float64)
+t_RGB_IMU = np.array([0.063044, -0.056937, -0.030558], dtype=np.float64)
+
+# 4. RGB Optical Frame from Camera Depth Optical Frame (Factory EEPROM T_rgb_depth)
 R_RGB_CAM_DEPTH = np.array([
     [ 0.999999, -0.001189,  0.000174],
     [ 0.001189,  0.999999, -0.000658],
     [-0.000174,  0.000658,  0.999999]
 ], dtype=np.float64)
 t_RGB_CAM_DEPTH = np.array([0.0237306, -0.0000932, -0.0004246], dtype=np.float64)
+
+# Camera forward optical axis (+Z in camera frame) expressed in IMU frame
+CAM_FWD_AXIS_IMU = R_IMU_CAM_DEPTH @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
 if _yaml is not None:
     try:
@@ -151,30 +176,38 @@ if _yaml is not None:
             _ext = _fl_cfg["/**"]["ros__parameters"]["extrin_calib"]
             R_IMU_LIDAR = np.array(_ext["extrinsic_R"], dtype=np.float64).reshape(3, 3)
             t_IMU_LIDAR = np.array(_ext["extrinsic_T"], dtype=np.float64)
+
         _pe_path = "/home/scanar/scanarMini/config/production_extrinsics.yaml"
         if os.path.exists(_pe_path):
             with open(_pe_path, "r") as _f:
                 _pe_cfg = _yaml.safe_load(_f)
-            _T_c0_l = np.array(_pe_cfg["active_transforms"]["T_cam0_airy_lidar"]["matrix"], dtype=np.float64)
-            R_CAM_LIDAR = _T_c0_l[:3, :3]
-            t_CAM_LIDAR = _T_c0_l[:3, 3]
-            _T_rgb_d = np.array(_pe_cfg["factory_transforms"]["T_rgb_depth"]["matrix"], dtype=np.float64)
-            R_RGB_CAM_DEPTH = _T_rgb_d[:3, :3]
-            t_RGB_CAM_DEPTH = _T_rgb_d[:3, 3]
+            if "active_transforms" in _pe_cfg and "T_cam0_airy_imu" in _pe_cfg["active_transforms"]:
+                _T_c0_imu = np.array(_pe_cfg["active_transforms"]["T_cam0_airy_imu"]["matrix"], dtype=np.float64)
+                R_CAM_IMU = _T_c0_imu[:3, :3]
+                t_CAM_IMU = _T_c0_imu[:3, 3]
+                R_IMU_CAM_DEPTH = R_CAM_IMU.T
+                t_IMU_CAM_DEPTH = -R_CAM_IMU.T @ t_CAM_IMU
+                CAM_FWD_AXIS_IMU = R_IMU_CAM_DEPTH @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+            if "active_transforms" in _pe_cfg and "T_rgb_airy_imu" in _pe_cfg["active_transforms"]:
+                _T_rgb_imu = np.array(_pe_cfg["active_transforms"]["T_rgb_airy_imu"]["matrix"], dtype=np.float64)
+                R_RGB_IMU = _T_rgb_imu[:3, :3]
+                t_RGB_IMU = _T_rgb_imu[:3, 3]
+
+            if "factory_transforms" in _pe_cfg and "T_rgb_depth" in _pe_cfg["factory_transforms"]:
+                _T_rgb_d = np.array(_pe_cfg["factory_transforms"]["T_rgb_depth"]["matrix"], dtype=np.float64)
+                R_RGB_CAM_DEPTH = _T_rgb_d[:3, :3]
+                t_RGB_CAM_DEPTH = _T_rgb_d[:3, 3]
     except Exception:
         pass
 
-# 3. Inverted: LiDAR from Camera Depth Optical Frame
+# Backward compatibility transforms
+R_CAM_LIDAR = R_CAM_IMU @ R_IMU_LIDAR
+t_CAM_LIDAR = R_CAM_IMU @ t_IMU_LIDAR + t_CAM_IMU
 R_LIDAR_CAM = R_CAM_LIDAR.T
 t_LIDAR_CAM = -R_CAM_LIDAR.T @ t_CAM_LIDAR
-
-# 4. IMU from Camera Depth Optical Frame (Direct rigid composition)
-R_IMU_CAM_DEPTH = R_IMU_LIDAR @ R_LIDAR_CAM
-t_IMU_CAM_DEPTH = R_IMU_LIDAR @ t_LIDAR_CAM + t_IMU_LIDAR
-
-# 6. RGB Optical Frame from LiDAR Frame
-R_RGB_LIDAR = R_RGB_CAM_DEPTH @ R_CAM_LIDAR
-t_RGB_LIDAR = R_RGB_CAM_DEPTH @ t_CAM_LIDAR + t_RGB_CAM_DEPTH
+R_RGB_LIDAR = R_RGB_IMU @ R_IMU_LIDAR
+t_RGB_LIDAR = R_RGB_IMU @ t_IMU_LIDAR + t_RGB_IMU
 
 
 def slerp_quat(q0, q1, alpha):
@@ -216,18 +249,23 @@ D_RGB_DEFAULT = np.array([-0.03113378, 0.03646491, 0.00048966, -0.00030747, -0.0
 def project_pts_to_rgb_plumb_bob(pts_rgb, fx, fy, cx, cy, d_coeffs=D_RGB_DEFAULT):
     """Vectorized Brown-Conrady (Plumb-Bob) camera projection for 3D points in RGB optical frame."""
     zr = pts_rgb[:, 2]
-    safe_z = np.where(zr > 1e-4, zr, 1.0)
+    safe_z = np.where(zr > 0.15, zr, 1.0)
     xn = pts_rgb[:, 0] / safe_z
     yn = pts_rgb[:, 1] / safe_z
-    r2 = xn * xn + yn * yn
+    # Pinhole frustum gate: prevent 6th-order radial polynomial (k3 < 0) from folding
+    # wide-angle 360-deg LiDAR points (|xn| > 1.12 or |yn| > 0.72) back into the image plane.
+    in_frustum = (zr > 0.15) & (np.abs(xn) <= 1.12) & (np.abs(yn) <= 0.72)
+    xn_c = np.where(in_frustum, xn, 0.0)
+    yn_c = np.where(in_frustum, yn, 0.0)
+    r2 = xn_c * xn_c + yn_c * yn_c
     r4 = r2 * r2
     r6 = r4 * r2
     k1, k2, p1, p2, k3 = d_coeffs[:5]
     radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-    xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn)
-    yd = yn * radial + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn
-    u = np.round(fx * xd + cx).astype(np.int32)
-    v = np.round(fy * yd + cy).astype(np.int32)
+    xd = xn_c * radial + 2.0 * p1 * xn_c * yn_c + p2 * (r2 + 2.0 * xn_c * xn_c)
+    yd = yn_c * radial + p1 * (r2 + 2.0 * yn_c * yn_c) + 2.0 * p2 * xn_c * yn_c
+    u = np.where(in_frustum, np.round(fx * xd + cx), -1.0).astype(np.int32)
+    v = np.where(in_frustum, np.round(fy * yd + cy), -1.0).astype(np.int32)
     return u, v, zr
 
 
@@ -553,6 +591,10 @@ class Ros2BridgeWorker(QThread):
     motion_stability_received = pyqtSignal(bool, float)
     livo_hud_received = pyqtSignal(str, float, int, float)
     
+    # NavVis Rotate-Before-Scan Ritual Signals
+    rotation_progress_received = pyqtSignal(float)
+    rotation_completed_received = pyqtSignal()
+
     # M12.9 Observability & Telemetry Signals
     map_points_updated = pyqtSignal(dict) # Sliced points for right-panel map
     telemetry_updated = pyqtSignal(dict)  # Live coverage %, counters, beam elevation breakdown
@@ -563,6 +605,14 @@ class Ros2BridgeWorker(QThread):
         self.bridge = CvBridge() if CvBridge is not None else None
         self.diag_recorder = diag_recorder
         self.lock = threading.RLock()
+
+        # NavVis 2-Stage Ritual Integration State
+        self.in_rotation_ritual = False
+        self.accumulated_rotation_deg = 0.0
+        self.last_imu_gyro_time = None
+        self.last_ax = 0.0
+        self.last_ay = 0.0
+        self.last_az = -9.81
 
         # Motion & Pose State
         self.current_x = 0.0
@@ -593,6 +643,9 @@ class Ros2BridgeWorker(QThread):
         self._last_map_dispatch_time = 0.0
         self._cached_map_points_data = None
         self.ros_node = None
+        self.camera_node = None
+        self.slam_node = None
+        self._preview_lock = threading.Lock()
 
         # Rolling timestamp queues for real-time Hz monitoring
         self._ts_rslidar = deque(maxlen=100)
@@ -618,7 +671,7 @@ class Ros2BridgeWorker(QThread):
         self.depth_max_m = 4.00
         self.surface_agreement_m = 0.050 # 50mm tolerance
         self.confidence_threshold = 0.50
-        self.max_turn_rate_rad_s = 0.85  # ~49 deg/s angular velocity gate for stereo depth
+        self.max_turn_rate_rad_s = 1.35  # ~77 deg/s angular velocity gate for stereo depth
         self.display_mode = "colorized_fused" # airy_only, stereo_only, fused, colorized_fused, accepted_rejected, observation_diag
 
         # Session Buffers & Point Stores
@@ -631,9 +684,31 @@ class Ros2BridgeWorker(QThread):
         self.gemini_frames = []
         self.rgb_keyframes = deque(maxlen=600)
 
+        # Co-Temporal Ring Buffers & Non-Blocking Processing Queues
+        self.rgb_ring = deque(maxlen=45)            # (sec_aligned, rgb_np) ~2.2s of decoded RGB history
+        self._raw_rgb_queue = deque(maxlen=12)      # (sec, arr_time, w, h, step, enc, raw_bytes)
+        self._raw_depth_queue = deque(maxlen=12)    # (sec, arr_time, w, h, step, enc, raw_bytes)
+        self._latest_raw_depth_tuple = None         # Latest raw depth frame for zero-contention 22 FPS preview
+        self._raw_lidar_queue = deque(maxlen=4)     # (sec, num_pts, step, raw_bytes)
+        self._last_preview_rgb_stamp = 0.0
+        self._last_preview_depth_stamp = 0.0
+        self._rgb_seq = 0
+        self._depth_seq = 0
+        self._last_preview_rgb_seq = -1
+        self._last_preview_depth_seq = -1
+        self._slam_wall_to_stamp_offset = 0.0
+        self._has_slam_clock_offset = False
+        self._pred_yaw = 0.0
+        self._last_imu_pred_time = 0.0
+        self._last_imu_emit_time = 0.0
+
         # Real-Time Display Map Buffers (World Frame)
         self.live_airy_voxels = {}   # (gx, gy, gz) -> [x, y, z, r, g, b, obs_state]
         self.live_stereo_voxels = {} # (gx, gy, gz) -> [x, y, z, r, g, b, is_accepted]
+        self._airy_cache_dirty = True
+        self._stereo_cache_dirty = True
+        self._airy_cached_arr = np.zeros((0, 7), dtype=np.float32)
+        self._stereo_cached_arr = np.zeros((0, 7), dtype=np.float32)
         self.live_elevation_stats = {"floor": 0, "wall": 0, "ceiling": 0, "total": 0}
 
         # Latest Raw Camera Frames
@@ -642,8 +717,8 @@ class Ros2BridgeWorker(QThread):
         self.latest_color_stamp = 0.0
         self.latest_depth_stamp = 0.0
 
-        # Milestone 12: Point Cloud Cleanup, Real-Time Spatial-Hash Toggle & Export State (from av_scan)
-        self.live_cleanup_enabled = True
+        # Milestone 12: Point Cloud Cleanup (Default OFF during live scan for maximum real-time FPS; active in Post/Preview/Export)
+        self.live_cleanup_enabled = False
         self.live_ground_lock_enabled = False
         self.live_cleanup_time_ms = 0.0
         self.m12_params = CleanupParams(
@@ -697,6 +772,22 @@ class Ros2BridgeWorker(QThread):
         with self.lock:
             self.live_ground_lock_enabled = bool(enabled)
 
+    def _get_voxel_arrays_locked(self):
+        """Returns cached (N, 7) float32 arrays for airy and stereo voxels without redundant Python loops."""
+        if self._airy_cache_dirty:
+            if len(self.live_airy_voxels) > 0:
+                self._airy_cached_arr = np.asarray(list(self.live_airy_voxels.values()), dtype=np.float32)
+            else:
+                self._airy_cached_arr = np.zeros((0, 7), dtype=np.float32)
+            self._airy_cache_dirty = False
+        if self._stereo_cache_dirty:
+            if len(self.live_stereo_voxels) > 0:
+                self._stereo_cached_arr = np.asarray(list(self.live_stereo_voxels.values()), dtype=np.float32)
+            else:
+                self._stereo_cached_arr = np.zeros((0, 7), dtype=np.float32)
+            self._stereo_cache_dirty = False
+        return self._airy_cached_arr, self._stereo_cached_arr
+
     def ensure_local_cloud_for_interactive_ops(self):
         """
         If no live ROS 2 hardware scan is in memory yet, loads the latest room scan or generates a
@@ -730,58 +821,111 @@ class Ros2BridgeWorker(QThread):
                 x, y, z = float(all_xyz[i, 0]), float(all_xyz[i, 1]), float(all_xyz[i, 2])
                 gx, gy, gz = int(math.floor(x / 0.02)), int(math.floor(y / 0.02)), int(math.floor(z / 0.02))
                 is_floor = abs(z) < 0.20
-                r_c = 70 if is_floor else 56
-                g_c = 160 if is_floor else 217
-                b_c = 210 if is_floor else 169
+                r_c = 70 if is_floor else 229
+                g_c = 160 if is_floor else 201
+                b_c = 210 if is_floor else 131
                 self.live_airy_voxels[(gx, gy, gz)] = [x, y, z, r_c, g_c, b_c, 1]
+            self._airy_cache_dirty = True
 
     def extract_raw_3d_points_for_mode(self, mode: str, airy_vals=None, stereo_vals=None) -> np.ndarray:
-        """Extracts (N, 6) float32 array [x, y, z, r, g, b] (RGB 0..255) for the active display mode."""
-        if airy_vals is None or stereo_vals is None:
+        """
+        Vectorized extraction of (N, 6) float32 array [x, y, z, r, g, b] (RGB 0..255) for the active display mode.
+        Clearly distinguishes:
+        - `airy_only`: Authoritative Airy 360° LiDAR in Artificial Vision Champagne Gold (229, 201, 131)
+        - `stereo_only`: Accepted Orbbec Gemini 336L Stereo Depth in Electric Cyan (34, 211, 238)
+        - `fused`: Structural Dual-Sensor Overlay — Airy LiDAR (Gold) + Gemini Stereo (Cyan)
+        - `colorized_fused`: True RGB Camera Texture mapped onto 3D geometry (rendered on top of subtle structural slate context)
+        """
+        if airy_vals is not None and isinstance(airy_vals, np.ndarray):
+            a_arr = airy_vals
+        elif airy_vals is not None:
+            a_arr = np.asarray(airy_vals, dtype=np.float32) if len(airy_vals) > 0 else np.zeros((0, 7), dtype=np.float32)
+        else:
             with self.lock:
-                airy_vals = list(self.live_airy_voxels.values())
-                stereo_vals = list(self.live_stereo_voxels.values())
+                a_arr, _ = self._get_voxel_arrays_locked()
 
-        pts_list = []
+        if stereo_vals is not None and isinstance(stereo_vals, np.ndarray):
+            s_arr = stereo_vals
+        elif stereo_vals is not None:
+            s_arr = np.asarray(stereo_vals, dtype=np.float32) if len(stereo_vals) > 0 else np.zeros((0, 7), dtype=np.float32)
+        else:
+            with self.lock:
+                _, s_arr = self._get_voxel_arrays_locked()
+
+        parts = []
         if mode == "airy_only":
-            for v in airy_vals:
-                pts_list.append((v[0], v[1], v[2], 56.0, 217.0, 169.0))
+            if len(a_arr) > 0:
+                out = np.empty((len(a_arr), 6), dtype=np.float32)
+                out[:, :3] = a_arr[:, :3]
+                out[:, 3] = 229.0
+                out[:, 4] = 201.0
+                out[:, 5] = 131.0
+                parts.append(out)
         elif mode == "stereo_only":
-            for v in stereo_vals:
-                pts_list.append((v[0], v[1], v[2], 25.0, 255.0, 255.0))
+            if len(s_arr) > 0:
+                out = np.empty((len(s_arr), 6), dtype=np.float32)
+                out[:, :3] = s_arr[:, :3]
+                is_acc = s_arr[:, 6] > 0.5
+                out[is_acc, 3:6] = [34.0, 211.0, 238.0]   # Accepted in vibrant Electric Cyan
+                out[~is_acc, 3:6] = [45.0, 130.0, 150.0]  # Unaccepted/warming in subtle cyan-slate
+                parts.append(out)
         elif mode == "fused":
-            for v in airy_vals:
-                pts_list.append((v[0], v[1], v[2], 56.0, 217.0, 169.0))
-            for v in stereo_vals:
-                if v[6]:
-                    pts_list.append((v[0], v[1], v[2], 25.0, 255.0, 255.0))
+            # Structural Sensor-Layer Comparison: Airy LiDAR = Champagne Gold, Gemini Stereo = Electric Cyan
+            if len(a_arr) > 0:
+                out_a = np.empty((len(a_arr), 6), dtype=np.float32)
+                out_a[:, :3] = a_arr[:, :3]
+                out_a[:, 3] = 229.0
+                out_a[:, 4] = 201.0
+                out_a[:, 5] = 131.0
+                parts.append(out_a)
+            if len(s_arr) > 0:
+                out_s = np.empty((len(s_arr), 6), dtype=np.float32)
+                out_s[:, :3] = s_arr[:, :3]
+                is_acc = s_arr[:, 6] > 0.5
+                out_s[is_acc, 3:6] = [34.0, 211.0, 238.0]
+                out_s[~is_acc, 3:6] = [45.0, 130.0, 150.0]
+                parts.append(out_s)
         elif mode == "accepted_rejected":
-            for v in stereo_vals:
-                if v[6]:
-                    pts_list.append((v[0], v[1], v[2], 63.0, 185.0, 80.0))
-                else:
-                    pts_list.append((v[0], v[1], v[2], 248.0, 81.0, 73.0))
+            if len(s_arr) > 0:
+                out = np.empty((len(s_arr), 6), dtype=np.float32)
+                out[:, :3] = s_arr[:, :3]
+                is_acc = s_arr[:, 6] > 0.5
+                out[is_acc, 3:6] = [74.0, 222.0, 128.0]
+                out[~is_acc, 3:6] = [248.0, 113.0, 113.0]
+                parts.append(out)
         elif mode == "observation_diag":
-            for v in airy_vals:
-                st = v[6]
-                if st == 0:
-                    pts_list.append((v[0], v[1], v[2], 110.0, 118.0, 129.0))
-                elif st == 1:
-                    pts_list.append((v[0], v[1], v[2], 210.0, 153.0, 34.0))
-                elif st == 2:
-                    pts_list.append((v[0], v[1], v[2], 56.0, 139.0, 253.0))
-                else:
-                    pts_list.append((v[0], v[1], v[2], 63.0, 185.0, 80.0))
-        else:  # colorized_fused (default)
-            for v in airy_vals:
-                pts_list.append((v[0], v[1], v[2], float(v[3]), float(v[4]), float(v[5])))
-            for v in stereo_vals:
-                if v[6]:
-                    pts_list.append((v[0], v[1], v[2], float(v[3]), float(v[4]), float(v[5])))
+            if len(a_arr) > 0:
+                out = np.empty((len(a_arr), 6), dtype=np.float32)
+                out[:, :3] = a_arr[:, :3]
+                st = np.rint(a_arr[:, 6]).astype(np.int32)
+                out[st == 0, 3:6] = [110.0, 118.0, 129.0]
+                out[st == 1, 3:6] = [229.0, 201.0, 131.0]
+                out[st == 2, 3:6] = [56.0, 139.0, 253.0]
+                out[st >= 3, 3:6] = [74.0, 222.0, 128.0]
+                parts.append(out)
+        else:  # colorized_fused (Default Truecolor RGB Mode)
+            # 1. Unobserved 360° structural periphery drawn first in subtle graphite slate (70, 75, 85)
+            # 2. True RGB-observed Airy & Stereo points drawn ON TOP with true camera colors
+            if len(a_arr) > 0:
+                st = np.rint(a_arr[:, 6]).astype(np.int32)
+                rgb_mask = (st == 1) | (st >= 3)
+                unobs = a_arr[~rgb_mask]
+                if len(unobs) > 0:
+                    out_u = np.empty((len(unobs), 6), dtype=np.float32)
+                    out_u[:, :3] = unobs[:, :3]
+                    out_u[:, 3:6] = [70.0, 75.0, 85.0]
+                    parts.append(out_u)
+                obs = a_arr[rgb_mask]
+                if len(obs) > 0:
+                    parts.append(obs[:, :6].copy())
+            if len(s_arr) > 0:
+                parts.append(s_arr[:, :6].copy())
 
-        if not pts_list:
+        if not parts:
             return np.zeros((0, 6), dtype=np.float32)
-        return np.asarray(pts_list, dtype=np.float32)
+        if len(parts) == 1:
+            return parts[0]
+        return np.vstack(parts)
 
     def run_m12_cleanup_preview(self, params: CleanupParams) -> ProcessingStats:
         """Runs full M12 cleanup pipeline (Voxel + SOR + ROR + RANSAC Ground Leveling) and activates preview."""
@@ -807,8 +951,10 @@ class Ros2BridgeWorker(QThread):
         with self.lock:
             if self.pre_cleanup_backup_airy is not None:
                 self.live_airy_voxels = dict(self.pre_cleanup_backup_airy)
+                self._airy_cache_dirty = True
             if self.pre_cleanup_backup_stereo is not None:
                 self.live_stereo_voxels = dict(self.pre_cleanup_backup_stereo)
+                self._stereo_cache_dirty = True
             self.cleanup_preview_active = False
             self.cleanup_preview_points = None
         self.dispatch_live_map_and_telemetry()
@@ -828,6 +974,8 @@ class Ros2BridgeWorker(QThread):
                 b_c = int(np.clip(pts[i, 5], 0, 255))
                 gx, gy, gz = int(math.floor(x / 0.02)), int(math.floor(y / 0.02)), int(math.floor(z / 0.02))
                 self.live_airy_voxels[(gx, gy, gz)] = [x, y, z, r_c, g_c, b_c, 1]
+            self._airy_cache_dirty = True
+            self._stereo_cache_dirty = True
             self.cleanup_preview_active = False
             self.cleanup_preview_points = None
             self.pre_cleanup_backup_airy = None
@@ -874,26 +1022,49 @@ class Ros2BridgeWorker(QThread):
         fmt = PointCloudProcessor.parse_export_format(format_str)
         return PointCloudProcessor.export_point_cloud(merged_pts, output_path, fmt, mesh_res_m)
 
-    def get_interpolated_odom(self, query_time):
-        """Finds closest SLERP-interpolated 6-DoF pose for exact epoch."""
+    def get_interpolated_odom(self, query_time, require_bracketed=False, max_clamp_dt=0.045):
+        """
+        Finds exact SLERP-interpolated 6-DoF pose for `query_time`.
+        If `require_bracketed=True`, returns `"WAIT"` when `query_time` is newer than the latest
+        completed LiDAR sweep (`odom_buffer[-1][0]`) so live camera/depth frames are never clamped
+        to a stale pose during rotation or walking.
+        """
         with self.lock:
-            if len(self.odom_buffer) == 0:
+            n_odom = len(self.odom_buffer)
+            if n_odom == 0:
                 return None
-            if len(self.odom_buffer) == 1:
-                t, p, q = self.odom_buffer[0]
-                return p, q
+            if n_odom == 1:
+                t0, p0, q0 = self.odom_buffer[0]
+                if not require_bracketed and abs(query_time - t0) <= max_clamp_dt:
+                    return p0, q0
+                return "WAIT" if require_bracketed and query_time > t0 else None
+
+            t_first = self.odom_buffer[0][0]
+            t_last = self.odom_buffer[-1][0]
+
+            if query_time > t_last:
+                if (query_time - t_last) <= 0.012:
+                    return self.odom_buffer[-1][1], self.odom_buffer[-1][2]
+                if require_bracketed:
+                    return "WAIT"
+                if (query_time - t_last) <= max_clamp_dt:
+                    return self.odom_buffer[-1][1], self.odom_buffer[-1][2]
+                return None
+
+            if query_time < t_first:
+                if abs(query_time - t_first) <= max_clamp_dt:
+                    return self.odom_buffer[0][1], self.odom_buffer[0][2]
+                return None
 
             times = [r[0] for r in self.odom_buffer]
-            idx = np.searchsorted(times, query_time)
-
-            if idx == 0:
+            idx = int(np.searchsorted(times, query_time))
+            if idx <= 0:
                 return self.odom_buffer[0][1], self.odom_buffer[0][2]
-            if idx >= len(self.odom_buffer):
+            if idx >= n_odom:
                 return self.odom_buffer[-1][1], self.odom_buffer[-1][2]
 
             t0, p0, q0 = self.odom_buffer[idx - 1]
             t1, p1, q1 = self.odom_buffer[idx]
-
             dt = t1 - t0
             if dt <= 1e-6:
                 return p0, q0
@@ -903,6 +1074,576 @@ class Ros2BridgeWorker(QThread):
             q_interp = slerp_quat(q0, q1, alpha)
             return p_interp, q_interp
 
+    def _find_closest_rgb_frame(self, target_sec, max_dt=0.065):
+        """Finds the decoded RGB frame in `self.rgb_ring` closest in timestamp to `target_sec`."""
+        with self.lock:
+            if len(self.rgb_ring) == 0:
+                return None, None
+            best_sec = None
+            best_img = None
+            best_dt = max_dt
+            for r_sec, r_img in self.rgb_ring:
+                dt = abs(r_sec - target_sec)
+                if dt <= best_dt:
+                    best_dt = dt
+                    best_sec = r_sec
+                    best_img = r_img
+            return best_sec, best_img
+
+    @staticmethod
+    def _lift_camera_rgb_for_display(rgb_arr: np.ndarray) -> np.ndarray:
+        """Applies a gentle hue-preserving gamma lift (gamma=0.78) so indoor RGB textures are vivid on AR glass."""
+        if len(rgb_arr) == 0:
+            return rgb_arr
+        norm = np.clip(rgb_arr.astype(np.float32) / 255.0, 0.0, 1.0)
+        lifted = np.clip((norm ** 0.78) * 238.0 + 17.0, 28.0, 255.0)
+        return lifted.astype(np.uint8)
+
+    def _align_sensor_stamp_to_slam(self, sensor_sec: float, arr_wall_time: float) -> float:
+        """
+        Ensures camera/depth timestamps live on the exact same clock timeline as FAST-LIVO2 `/aft_mapped_to_init`.
+        Because FAST-LIVO2 stamps `/aft_mapped_to_init` with the LiDAR sweep timestamp (~0.10-0.15s behind wall-clock),
+        maps the camera arrival time onto the SLAM timeline via `self._slam_wall_to_stamp_offset`.
+        """
+        with self.lock:
+            has_off = self._has_slam_clock_offset
+            off = self._slam_wall_to_stamp_offset
+            n_odom = len(self.odom_buffer)
+            t_last = self.odom_buffer[-1][0] if n_odom > 0 else 0.0
+
+        if sensor_sec <= 1.0:
+            return arr_wall_time + off if has_off else arr_wall_time
+        if has_off:
+            expected_slam_sec = arr_wall_time + off
+            if abs(sensor_sec - expected_slam_sec) > 0.025:
+                return expected_slam_sec
+        elif n_odom > 0 and abs(sensor_sec - t_last) > 0.15:
+            return t_last
+        return sensor_sec
+
+    @staticmethod
+    def _decode_rgb_buffer(raw: bytes, w: int, h: int, step: int, enc: str) -> Optional[np.ndarray]:
+        """Robustly decodes ROS 2 Image raw bytes into contiguous (H, W, 3) uint8 RGB array across all Orbbec encodings."""
+        if w <= 0 or h <= 0 or len(raw) == 0:
+            return None
+        enc_l = (enc or "rgb8").lower()
+        buf = np.frombuffer(raw, dtype=np.uint8)
+        if "bgra" in enc_l or "rgba" in enc_l:
+            ch = 4
+            row_bytes = step if step >= w * ch else w * ch
+            if len(buf) < h * row_bytes:
+                return None
+            img2d = buf[: h * row_bytes].reshape((h, row_bytes))[:, : w * ch].reshape((h, w, ch))
+            return cv2.cvtColor(img2d, cv2.COLOR_BGRA2RGB if "bgra" in enc_l else cv2.COLOR_RGBA2RGB)
+        if "yuv" in enc_l or "yuyv" in enc_l or "uyvy" in enc_l:
+            ch = 2
+            row_bytes = step if step >= w * ch else w * ch
+            if len(buf) < h * row_bytes:
+                return None
+            img2d = buf[: h * row_bytes].reshape((h, row_bytes))[:, : w * ch].reshape((h, w, ch))
+            code = cv2.COLOR_YUV2RGB_UYVY if "uyvy" in enc_l else cv2.COLOR_YUV2RGB_YUYV
+            return cv2.cvtColor(img2d, code)
+        if "mono8" in enc_l or "8uc1" in enc_l:
+            row_bytes = step if step >= w else w
+            if len(buf) < h * row_bytes:
+                return None
+            gray = buf[: h * row_bytes].reshape((h, row_bytes))[:, :w]
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        # Default 3-channel rgb8 / bgr8
+        ch = 3
+        row_bytes = step if step >= w * ch else w * ch
+        if len(buf) < h * row_bytes:
+            return None
+        img3 = buf[: h * row_bytes].reshape((h, row_bytes))[:, : w * ch].reshape((h, w, 3))
+        if "bgr" in enc_l:
+            return cv2.cvtColor(img3, cv2.COLOR_BGR2RGB)
+        return np.ascontiguousarray(img3)
+
+    @staticmethod
+    def _decode_depth_buffer(raw: bytes, w: int, h: int, step: int, enc: str) -> Optional[np.ndarray]:
+        """Robustly decodes ROS 2 Depth Image raw bytes into contiguous (H, W) uint16 millimeters array."""
+        if w <= 0 or h <= 0 or len(raw) == 0:
+            return None
+        enc_l = (enc or "16uc1").lower()
+        if "32fc1" in enc_l:
+            row_floats = (step // 4) if step >= w * 4 else w
+            buf_f = np.frombuffer(raw, dtype=np.float32)
+            if len(buf_f) < h * row_floats:
+                return None
+            d_m = buf_f[: h * row_floats].reshape((h, row_floats))[:, :w]
+            valid = np.isfinite(d_m) & (d_m > 0.0) & (d_m < 65.0)
+            out_mm = np.zeros((h, w), dtype=np.uint16)
+            out_mm[valid] = np.clip(d_m[valid] * 1000.0, 0, 65535).astype(np.uint16)
+            return out_mm
+        # Default 16UC1 / MONO16 (uint16 millimeters)
+        row_u16 = (step // 2) if step >= w * 2 else w
+        buf_u16 = np.frombuffer(raw, dtype=np.uint16)
+        if len(buf_u16) < h * row_u16:
+            return None
+        return np.ascontiguousarray(buf_u16[: h * row_u16].reshape((h, row_u16))[:, :w])
+
+    def _emit_composite_camera_frame(self):
+        """Emits cleanly isolated side-by-side RGB (Left) and Depth Heatmap (Right) at up to 22 FPS."""
+        now = time.time()
+        if now - self._last_image_emit < 0.042:  # ~24 FPS smooth low-latency stream
+            return
+
+        with self.lock:
+            rgb_img = self.latest_color_raw
+            rgb_seq = self._rgb_seq
+            depth_img = self.latest_depth_raw
+            depth_seq = self._depth_seq
+            min_d = self.depth_min_m
+            max_d = self.depth_max_m
+
+        if rgb_img is None and depth_img is None:
+            return
+        if rgb_seq == self._last_preview_rgb_seq and depth_seq == self._last_preview_depth_seq:
+            return
+
+        self._last_image_emit = now
+        self._last_preview_rgb_seq = rgb_seq
+        self._last_preview_depth_seq = depth_seq
+
+        target_w, target_h = 280, 175
+        if rgb_img is not None:
+            preview_rgb = cv2.resize(rgb_img, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        else:
+            preview_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            cv2.putText(preview_rgb, "RGB: STANDBY", (45, target_h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (139, 148, 158), 1)
+
+        if depth_img is not None:
+            depth_resized = cv2.resize(depth_img, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+            d_m = depth_resized.astype(np.float32) * 0.001
+            valid_mask = (d_m >= min_d) & (d_m <= max_d)
+            d_norm = np.clip((d_m - min_d) / max(0.1, (max_d - min_d)) * 255.0, 0, 255).astype(np.uint8)
+            depth_color = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
+            depth_color_rgb = cv2.cvtColor(depth_color, cv2.COLOR_BGR2RGB)
+            depth_color_rgb[~valid_mask] = [20, 20, 25]
+        else:
+            depth_color_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            cv2.putText(depth_color_rgb, "DEPTH: STANDBY", (30, target_h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (139, 148, 158), 1)
+
+        combined = np.ascontiguousarray(np.hstack((preview_rgb, depth_color_rgb)))
+        h, w, ch = combined.shape
+        fmt_rgb = QImage.Format_RGB888 if hasattr(QImage, 'Format_RGB888') else QImage.Format.Format_RGB888
+        qimg = QImage(combined.data, w, h, ch * w, fmt_rgb).copy()
+        self.image_received.emit(qimg)
+
+    def _drain_and_emit_camera_preview(self):
+        """
+        Decodes queued RGB frames and the newest Depth frame for the live ~24 FPS
+        side-by-side RGB + Depth Heatmap preview. Runs exclusively on `Camera_Preview_Thread`
+        so 3D point cloud voxelization or KD-tree queries can never freeze the camera stream.
+        """
+        if not self._preview_lock.acquire(blocking=False):
+            return
+        try:
+            # 1. Decode up to 2 freshest queued RGB frames (dropping stale backlog if any)
+            rgb_items = []
+            with self.lock:
+                while len(self._raw_rgb_queue) > 2:
+                    self._raw_rgb_queue.popleft()
+                while len(self._raw_rgb_queue) > 0:
+                    rgb_items.append(self._raw_rgb_queue.popleft())
+
+            for sec, arr_time, w, h, step, enc, raw in rgb_items:
+                try:
+                    rgb = self._decode_rgb_buffer(raw, w, h, step, enc)
+                    if rgb is not None:
+                        sec_aligned = self._align_sensor_stamp_to_slam(sec, arr_time)
+                        with self.lock:
+                            self.latest_color_raw = rgb
+                            self.latest_color_stamp = sec_aligned
+                            self._rgb_seq += 1
+                            self.rgb_ring.append((sec_aligned, rgb))
+                except Exception:
+                    pass
+
+            # 2. Decode newest depth frame from `_latest_raw_depth_tuple` for immediate Depth Heatmap display
+            with self.lock:
+                newest_depth_tuple = self._latest_raw_depth_tuple
+            if newest_depth_tuple is not None:
+                d_sec, d_arr_time, d_w, d_h, d_step, d_enc, d_raw = newest_depth_tuple
+                if d_arr_time != self.latest_depth_stamp:
+                    try:
+                        d_decoded = self._decode_depth_buffer(d_raw, d_w, d_h, d_step, d_enc)
+                        if d_decoded is not None:
+                            with self.lock:
+                                self.latest_depth_raw = d_decoded
+                                self.latest_depth_stamp = d_arr_time
+                                self._depth_seq += 1
+                    except Exception:
+                        pass
+
+            # 3. Emit smooth ~24 FPS camera preview immediately
+            self._emit_composite_camera_frame()
+        finally:
+            self._preview_lock.release()
+
+    def _process_pending_sensor_queues(self):
+        """
+        Runs on the worker thread (completely off the ROS 2 spin thread and camera preview thread):
+        1. Processes queued LiDAR sweeps (`/cloud_registered`) with Z-buffered co-temporal RGB projection.
+        2. Processes queued Gemini Depth frames at ~18 Hz with depth-proportional surface continuity,
+           local Airy KD-tree corroboration, and continuous non-downgrading voxel accumulation into `self.live_stereo_voxels`.
+        """
+        # 1. Process queued LiDAR sweeps (/cloud_registered)
+        while True:
+            with self.lock:
+                if len(self._raw_lidar_queue) == 0:
+                    break
+                sec, num_points, point_step, raw = self._raw_lidar_queue.popleft()
+            try:
+                dt = np.dtype({
+                    'names': ['x', 'y', 'z'],
+                    'formats': ['<f4', '<f4', '<f4'],
+                    'offsets': [0, 4, 8],
+                    'itemsize': point_step
+                })
+                pts = np.frombuffer(raw, dtype=dt, count=num_points)
+                valid = np.isfinite(pts['x']) & np.isfinite(pts['y']) & np.isfinite(pts['z'])
+                pts_valid = pts[valid]
+                if len(pts_valid) == 0:
+                    continue
+
+                xyz_w = np.column_stack((pts_valid['x'], pts_valid['y'], pts_valid['z'])).astype(np.float64)
+
+                # Compute Live Beam Angular Elevation Distribution in Sensor Body Frame
+                pose = self.get_interpolated_odom(sec, require_bracketed=False, max_clamp_dt=0.25)
+                if (pose is None or pose == "WAIT") and self.using_slam_odom:
+                    pose = (
+                        np.array([self.current_x, self.current_y, self.current_z], dtype=np.float64),
+                        np.array(self.current_quat, dtype=np.float64),
+                    )
+                if pose is not None and pose != "WAIT":
+                    pos_w, quat = pose
+                    R_w_imu = Rotation.from_quat(quat).as_matrix()
+                    p_body = (xyz_w - pos_w) @ R_w_imu
+                    norm_xy = np.linalg.norm(p_body[:, :2], axis=1)
+                    elev_deg = np.degrees(np.arctan2(p_body[:, 2], np.maximum(0.01, norm_xy)))
+
+                    floor_cnt = int(np.sum(elev_deg < -30.0))
+                    wall_cnt = int(np.sum((elev_deg >= -30.0) & (elev_deg <= 30.0)))
+                    ceil_cnt = int(np.sum(elev_deg > 30.0))
+                    total_cnt = len(elev_deg)
+
+                    with self.lock:
+                        self.live_elevation_stats = {
+                            "floor": floor_cnt,
+                            "wall": wall_cnt,
+                            "ceiling": ceil_cnt,
+                            "total": total_cnt,
+                        }
+
+                # Pre-reduce sweep to unique 5cm voxels in NumPy outside the lock
+                voxel_size = 0.05
+                gx_all = np.floor(xyz_w[:, 0] / voxel_size).astype(np.int64)
+                gy_all = np.floor(xyz_w[:, 1] / voxel_size).astype(np.int64)
+                gz_all = np.floor(xyz_w[:, 2] / voxel_size).astype(np.int64)
+                packed = ((gx_all + 500000) << 42) | ((gy_all + 500000) << 21) | (gz_all + 500000)
+                _, u_idx = np.unique(packed, return_index=True)
+
+                xyz_u = xyz_w[u_idx]
+                gx = gx_all[u_idx]
+                gy = gy_all[u_idx]
+                gz = gz_all[u_idx]
+
+                # Co-temporal RGB lookup from ring buffer (aligned to SLAM epoch `sec`)
+                rgb_sec, rgb_img = self._find_closest_rgb_frame(sec, max_dt=0.25)
+                with self.lock:
+                    if rgb_img is None and self.latest_color_raw is not None and (time.time() - self.last_camera_time) < 0.50:
+                        rgb_img = self.latest_color_raw
+                        rgb_sec = sec
+                    d_rgb = self.d_rgb
+                    ang_speed = self.current_ang_speed
+                    is_rec = self.is_session_recording
+
+                rgb_w_pose = (
+                    self.get_interpolated_odom(rgb_sec, require_bracketed=False, max_clamp_dt=0.35)
+                    if (rgb_img is not None and rgb_sec is not None)
+                    else None
+                )
+                if (rgb_w_pose is None or rgb_w_pose == "WAIT") and pose is not None and pose != "WAIT":
+                    rgb_w_pose = pose
+
+                obs_states = np.zeros(len(xyz_u), dtype=np.uint8)  # 0=Unobserved, 1=RGB, 2=Depth, 3=Both
+                vox_colors = np.full((len(xyz_u), 3), [64, 68, 78], dtype=np.uint8)
+
+                if (
+                    rgb_img is not None
+                    and rgb_w_pose is not None
+                    and rgb_w_pose != "WAIT"
+                    and ang_speed <= max(self.max_turn_rate_rad_s * 2.2, 2.8)
+                ):
+                    pos_c, quat_c = rgb_w_pose
+                    R_w_imu_c = Rotation.from_quat(quat_c).as_matrix()
+
+                    # Save bracketed keyframe if recording
+                    if is_rec:
+                        with self.lock:
+                            if len(self.rgb_keyframes) == 0 or (rgb_sec - self.rgb_keyframes[-1][0] >= 0.20):
+                                self.rgb_keyframes.append((rgb_sec, rgb_img, R_w_imu_c, pos_c))
+
+                    p_imu_c = (xyz_u - pos_c) @ R_w_imu_c
+                    p_rgb_c = p_imu_c @ R_RGB_IMU.T + t_RGB_IMU
+                    u, v, zr = project_pts_to_rgb_plumb_bob(
+                        p_rgb_c, self.fx_rgb, self.fy_rgb, self.cx_rgb, self.cy_rgb, d_rgb
+                    )
+                    rgb_h, rgb_w = rgb_img.shape[:2]
+                    # Skip 10px lens border for clean color projection
+                    in_rgb_fov = (zr > 0.30) & (zr < 5.5) & (u >= 10) & (u < rgb_w - 10) & (v >= 10) & (v < rgb_h - 10)
+                    fov_idx = np.nonzero(in_rgb_fov)[0]
+                    if len(fov_idx) > 0:
+                        u_f = u[fov_idx]
+                        v_f = v[fov_idx]
+                        z_f = zr[fov_idx]
+                        # 320x200 Z-buffer occlusion gate so foreground walls block background walls
+                        u_b = np.clip(u_f // 4, 0, (rgb_w // 4) - 1)
+                        v_b = np.clip(v_f // 4, 0, (rgb_h // 4) - 1)
+                        z_buf = np.full((rgb_h // 4, rgb_w // 4), np.inf, dtype=np.float64)
+                        np.minimum.at(z_buf, (v_b, u_b), z_f)
+                        visible = z_f <= (z_buf[v_b, u_b] + 0.14)
+                        vis_idx = fov_idx[visible]
+                        if len(vis_idx) > 0:
+                            obs_states[vis_idx] = 1
+                            sampled = rgb_img[v[vis_idx], u[vis_idx]]
+                            vox_colors[vis_idx] = self._lift_camera_rgb_for_display(sampled)
+
+                gx_list = gx.tolist()
+                gy_list = gy.tolist()
+                gz_list = gz.tolist()
+                xyz_list = xyz_u.tolist()
+                col_list = vox_colors.tolist()
+                st_list = obs_states.tolist()
+
+                with self.lock:
+                    airy_voxels = self.live_airy_voxels
+                    stereo_voxels = self.live_stereo_voxels
+                    for i in range(len(xyz_list)):
+                        key = (gx_list[i], gy_list[i], gz_list[i])
+                        has_stereo_match = key in stereo_voxels
+                        state = st_list[i]
+                        r_c, g_c, b_c = col_list[i]
+
+                        prev = airy_voxels.get(key)
+                        if prev is not None and state == 0 and prev[6] in (1, 3):
+                            state = 1
+                            r_c, g_c, b_c = prev[3], prev[4], prev[5]
+
+                        if has_stereo_match:
+                            state = 3 if state in (1, 3) else 2
+
+                        pt_xyz = xyz_list[i]
+                        airy_voxels[key] = [pt_xyz[0], pt_xyz[1], pt_xyz[2], r_c, g_c, b_c, state]
+
+                    self._airy_cache_dirty = True
+                    if self.is_session_recording:
+                        self.airy_sweeps.append((sec, xyz_w))
+            except Exception:
+                pass
+
+        # 2. Process queued Gemini 336L Stereo Depth frames (~18 Hz continuous 3D map accumulation)
+        now = time.time()
+        if (now - self._last_depth_voxel_time) >= 0.050:
+            depth_item = None
+            with self.lock:
+                if len(self._raw_depth_queue) > 0:
+                    # Pop the freshest depth frame and clear older queued frames so there is zero lag
+                    depth_item = self._raw_depth_queue.pop()
+                    self._raw_depth_queue.clear()
+                    # Smoothly decay angular speed so normal hand/head panning never stays locked out
+                    self.current_ang_speed *= 0.90
+                    min_d = self.depth_min_m
+                    max_d = self.depth_max_m
+                    agree_tol = self.surface_agreement_m
+                    ang_speed = self.current_ang_speed
+                    d_rgb = self.d_rgb
+
+            if depth_item is not None:
+                sec, arr_time, w, h, step, enc, raw = depth_item
+                sec_aligned = self._align_sensor_stamp_to_slam(sec, arr_time)
+
+                # Resolve 6-DoF pose: interpolated SLAM odom -> latest odom_buffer -> current pose fallback
+                pose = self.get_interpolated_odom(sec_aligned, require_bracketed=False, max_clamp_dt=0.60)
+                if pose is None or pose == "WAIT":
+                    with self.lock:
+                        if len(self.odom_buffer) > 0:
+                            _, last_p, last_q = self.odom_buffer[-1]
+                            pose = (last_p.copy(), last_q.copy())
+                        else:
+                            pose = (
+                                np.array([self.current_x, self.current_y, self.current_z], dtype=np.float64),
+                                np.array(self.current_quat, dtype=np.float64),
+                            )
+
+                if pose is not None and pose != "WAIT":
+                    # Only gate extreme whip-turns (> 3.2 rad/s = 183 deg/s) so normal panning builds the Gemini map!
+                    if ang_speed > max(self.max_turn_rate_rad_s * 2.5, 3.2):
+                        with self.lock:
+                            self.cnt_depth_gated_turn += 1
+                    else:
+                        self._last_depth_voxel_time = now
+                        try:
+                            with self.lock:
+                                cached_d = self.latest_depth_raw if (arr_time == self.latest_depth_stamp) else None
+                            depth_img = cached_d if cached_d is not None else self._decode_depth_buffer(raw, w, h, step, enc)
+                            if depth_img is not None:
+                                with self.lock:
+                                    if arr_time != self.latest_depth_stamp:
+                                        self.latest_depth_raw = depth_img
+                                        self.latest_depth_stamp = arr_time
+                                        self._depth_seq += 1
+
+                                sub = 5  # Dense 5x subsampling (~3,200 rays/frame) for continuous stereo map building
+                                d_sub = depth_img[::sub, ::sub].astype(np.int32)
+                                # Depth-proportional discontinuity gate: allows slanted walls/floors across 5px stride
+                                # (~6.5% of depth, minimum 95mm) while rejecting >20cm occlusion edge flying pixels
+                                max_dz = np.maximum(95, (d_sub * 0.065).astype(np.int32))
+                                dz_x = np.abs(d_sub - np.roll(d_sub, 1, axis=1))
+                                dz_y = np.abs(d_sub - np.roll(d_sub, 1, axis=0))
+                                valid_mask = (
+                                    (d_sub >= int(min_d * 1000))
+                                    & (d_sub <= int(max_d * 1000))
+                                    & (dz_x <= max_dz)
+                                    & (dz_y <= max_dz)
+                                )
+                                valid_mask[0, :] = False
+                                valid_mask[-1, :] = False
+                                valid_mask[:, 0] = False
+                                valid_mask[:, -1] = False
+
+                                v_idx, u_idx = np.nonzero(valid_mask)
+                                if len(u_idx) > 0:
+                                    pos_w, quat = pose
+                                    R_w_imu = Rotation.from_quat(quat).as_matrix()
+                                    R_w_cam_depth = R_w_imu @ R_IMU_CAM_DEPTH
+                                    t_w_cam_depth = R_w_imu @ t_IMU_CAM_DEPTH + pos_w
+
+                                    u_px = u_idx * sub
+                                    v_px = v_idx * sub
+                                    z_vals = d_sub[v_idx, u_idx].astype(np.float64) * 0.001
+
+                                    x_cam = (u_px - self.cx_d) * z_vals / self.fx_d
+                                    y_cam = (v_px - self.cy_d) * z_vals / self.fy_d
+                                    pts_cam = np.vstack((x_cam, y_cam, z_vals)).T
+                                    pts_w = pts_cam @ R_w_cam_depth.T + t_w_cam_depth
+
+                                    # Co-temporal RGB color assignment from `self.rgb_ring`
+                                    rgb_sec, rgb_img = self._find_closest_rgb_frame(sec_aligned, max_dt=0.25)
+                                    if rgb_img is None:
+                                        with self.lock:
+                                            if self.latest_color_raw is not None and (now - self.last_camera_time) < 0.50:
+                                                rgb_img = self.latest_color_raw
+                                    colors = np.full((len(pts_w), 3), [34, 211, 238], dtype=np.uint8)
+                                    has_rgb_color = np.zeros(len(pts_w), dtype=bool)
+                                    if rgb_img is not None:
+                                        rgb_h, rgb_w = rgb_img.shape[:2]
+                                        pts_rgb_frame = (pts_cam @ R_RGB_CAM_DEPTH.T) + t_RGB_CAM_DEPTH
+                                        u_r, v_r, zr = project_pts_to_rgb_plumb_bob(
+                                            pts_rgb_frame, self.fx_rgb, self.fy_rgb, self.cx_rgb, self.cy_rgb, d_rgb
+                                        )
+                                        in_fov = (zr > 0.25) & (u_r >= 8) & (u_r < rgb_w - 8) & (v_r >= 8) & (v_r < rgb_h - 8)
+                                        if np.any(in_fov):
+                                            has_rgb_color[in_fov] = True
+                                            sampled = rgb_img[v_r[in_fov], u_r[in_fov]]
+                                            colors[in_fov] = self._lift_camera_rgb_for_display(sampled)
+
+                                    # Local Full-Resolution Airy Reference Cloud (within camera range of pos_w)
+                                    with self.lock:
+                                        a_arr, _ = self._get_voxel_arrays_locked()
+                                    airy_pts_arr = None
+                                    if len(a_arr) > 30:
+                                        a_xyz = a_arr[:, :3].astype(np.float64)
+                                        d2_sensor = np.sum((a_xyz - pos_w) ** 2, axis=1)
+                                        local_mask = d2_sensor <= ((max_d + 1.25) ** 2)
+                                        local_xyz = a_xyz[local_mask]
+                                        if len(local_xyz) > 25:
+                                            step_loc = max(1, len(local_xyz) // 14000)
+                                            airy_pts_arr = local_xyz[::step_loc]
+
+                                    # Smooth contiguous stereo surface check (fills inter-ring surfaces cleanly out to max_d)
+                                    smooth_tol = np.maximum(75, (d_sub[v_idx, u_idx] * 0.052).astype(np.int32))
+                                    smooth_patch = (
+                                        (dz_x[v_idx, u_idx] <= smooth_tol)
+                                        & (dz_y[v_idx, u_idx] <= smooth_tol)
+                                        & (z_vals <= max_d)
+                                    )
+                                    is_accepted = np.ones(len(pts_w), dtype=bool)
+                                    if airy_pts_arr is not None:
+                                        tree_a = cKDTree(airy_pts_arr)
+                                        dists, nn_idx = tree_a.query(pts_w, k=1, workers=1)
+                                        # Corroborate within LiDAR inter-ring spacing (~26cm) OR smooth contiguous surface patch
+                                        corrob_tol = max(agree_tol * 5.0, 0.26)
+                                        is_accepted = (dists <= corrob_tol) | smooth_patch
+                                        # Gentle ASPS Surface Snapping when within 9cm of an Airy voxel
+                                        snap_mask = is_accepted & (dists <= max(agree_tol * 1.8, 0.09))
+                                        if np.any(snap_mask):
+                                            pts_w[snap_mask] = 0.60 * airy_pts_arr[nn_idx[snap_mask]] + 0.40 * pts_w[snap_mask]
+
+                                    voxel_size = 0.05
+                                    gx = np.floor(pts_w[:, 0] / voxel_size).astype(np.int64)
+                                    gy = np.floor(pts_w[:, 1] / voxel_size).astype(np.int64)
+                                    gz = np.floor(pts_w[:, 2] / voxel_size).astype(np.int64)
+                                    packed = ((gx + 500000) << 42) | ((gy + 500000) << 21) | (gz + 500000)
+                                    _, u_vox = np.unique(packed, return_index=True)
+
+                                    gx_u = gx[u_vox].tolist()
+                                    gy_u = gy[u_vox].tolist()
+                                    gz_u = gz[u_vox].tolist()
+                                    pts_u = pts_w[u_vox].tolist()
+                                    col_u = colors[u_vox].tolist()
+                                    acc_u = is_accepted[u_vox].tolist()
+                                    rgb_u = has_rgb_color[u_vox].tolist()
+
+                                    with self.lock:
+                                        stereo_voxels = self.live_stereo_voxels
+                                        airy_voxels = self.live_airy_voxels
+                                        for idx_i in range(len(u_vox)):
+                                            key = (gx_u[idx_i], gy_u[idx_i], gz_u[idx_i])
+                                            p_xyz = pts_u[idx_i]
+                                            c_rgb = col_u[idx_i]
+                                            acc_flag = bool(acc_u[idx_i])
+                                            prev_s = stereo_voxels.get(key)
+                                            if prev_s is not None:
+                                                # Never downgrade an already-accepted stereo voxel to rejected
+                                                if prev_s[6] and not acc_flag:
+                                                    continue
+                                                if prev_s[6] and acc_flag:
+                                                    p_xyz = [
+                                                        0.65 * prev_s[0] + 0.35 * p_xyz[0],
+                                                        0.65 * prev_s[1] + 0.35 * p_xyz[1],
+                                                        0.65 * prev_s[2] + 0.35 * p_xyz[2],
+                                                    ]
+                                                    if not rgb_u[idx_i]:
+                                                        c_rgb = [prev_s[3], prev_s[4], prev_s[5]]
+                                            stereo_voxels[key] = [
+                                                p_xyz[0], p_xyz[1], p_xyz[2],
+                                                c_rgb[0], c_rgb[1], c_rgb[2],
+                                                acc_flag,
+                                            ]
+                                            # Also transfer co-temporal RGB color onto matching Airy voxel if not yet RGB-colored
+                                            if acc_flag and rgb_u[idx_i]:
+                                                a_vox = airy_voxels.get(key)
+                                                if a_vox is not None and a_vox[6] in (0, 2):
+                                                    a_vox[3], a_vox[4], a_vox[5] = c_rgb[0], c_rgb[1], c_rgb[2]
+                                                    a_vox[6] = 3
+                                                    self._airy_cache_dirty = True
+                                                elif a_vox is not None and a_vox[6] == 1:
+                                                    a_vox[6] = 3
+                                                    self._airy_cache_dirty = True
+
+                                        self._stereo_cache_dirty = True
+                                        if self.is_session_recording:
+                                            acc_pts = pts_w[is_accepted]
+                                            acc_cols = colors[is_accepted]
+                                            if len(acc_pts) > 0:
+                                                self.gemini_frames.append((sec_aligned, acc_pts, acc_cols))
+                        except Exception:
+                            pass
+
     def run(self):
         if not HAS_ROS2 or rclpy is None:
             while self.running:
@@ -910,14 +1651,20 @@ class Ros2BridgeWorker(QThread):
                     self.dispatch_live_map_and_telemetry()
                 except Exception:
                     pass
-                time.sleep(0.10)
+                time.sleep(0.08)
             return
 
         if not rclpy.ok():
             rclpy.init()
 
-        node = Node("scanhub_m12_9_gui_bridge")
-        print(f"[scanHUB OS] ROS 2 Bridge Connected on Domain ID: {os.environ.get('ROS_DOMAIN_ID', '0')}")
+        # Single unified Node with a persistent SingleThreadedExecutor (preserves round-robin `_cb_iter`
+        # across all subscriptions in a single wait-set without multi-executor context contention)
+        node = Node("scanhub_m12_9_bridge")
+        self.ros_node = node
+        print(
+            f"[scanHUB OS] ROS 2 Bridge Connected on Domain ID: {os.environ.get('ROS_DOMAIN_ID', '0')} "
+            f"(RMW: {os.environ.get('RMW_IMPLEMENTATION', 'rmw_fastrtps_cpp')})"
+        )
 
         def depth_info_callback(msg: CameraInfo):
             if msg.k[0] > 10.0:
@@ -937,326 +1684,50 @@ class Ros2BridgeWorker(QThread):
                     if len(msg.d) >= 5 and any(abs(x) > 1e-9 for x in msg.d[:5]):
                         self.d_rgb = np.array(msg.d[:5], dtype=np.float64)
 
-        def emit_composite_camera_frame():
-            """Emits cleanly isolated side-by-side RGB (Left) and Depth Heatmap (Right)."""
-            now = time.time()
-            if now - self._last_image_emit < 0.066: # Max ~15 FPS to conserve Jetson CPU
-                return
-            self._last_image_emit = now
-
-            with self.lock:
-                rgb_img = self.latest_color_raw
-                depth_img = self.latest_depth_raw
-                min_d = self.depth_min_m
-                max_d = self.depth_max_m
-
-            if rgb_img is None:
-                return
-
-            target_w, target_h = 280, 175
-
-            # 1. Clean Isolated RGB Stream (Left)
-            preview_rgb = cv2.resize(rgb_img, (target_w, target_h))
-
-            # 2. Clean Isolated Depth Heatmap Stream (Right)
-            if depth_img is not None:
-                depth_resized = cv2.resize(depth_img, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-                d_m = depth_resized.astype(np.float32) * 0.001 # mm -> m
-                valid_mask = (d_m >= min_d) & (d_m <= max_d)
-
-                # Generate Turbo Colormap Depth Heatmap
-                d_norm = np.clip((d_m - min_d) / max(0.1, (max_d - min_d)) * 255.0, 0, 255).astype(np.uint8)
-                depth_color = cv2.applyColorMap(d_norm, cv2.COLORMAP_TURBO)
-                depth_color_rgb = cv2.cvtColor(depth_color, cv2.COLOR_BGR2RGB)
-                depth_color_rgb[~valid_mask] = [20, 20, 25] # Dim out-of-range pixels
-            else:
-                depth_color_rgb = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-                cv2.putText(depth_color_rgb, "DEPTH: STANDBY", (30, target_h // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (139, 148, 158), 1)
-
-            # Pure Isolated Side-by-Side: Clean RGB (Left) + Pure Depth Heatmap (Right)
-            combined = np.ascontiguousarray(np.hstack((preview_rgb, depth_color_rgb)))
-
-            ch = combined.shape[2]
-            w = combined.shape[1]
-            h = combined.shape[0]
-            bytes_per_line = ch * w
-            fmt_rgb = QImage.Format_RGB888 if hasattr(QImage, 'Format_RGB888') else QImage.Format.Format_RGB888
-            qimg = QImage(combined.data, w, h, bytes_per_line, fmt_rgb).copy()
-            self.image_received.emit(qimg)
-
         def rgb_color_callback(msg: Image):
+            """Ultra-fast (<0.15ms) non-blocking RGB ingestion."""
             self.cnt_camera += 1
             now = time.time()
             sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             self.last_camera_time = now
-
-            try:
-                raw = bytes(msg.data)
-                enc = msg.encoding.lower()
-                if "bgr8" in enc:
-                    bgr = np.frombuffer(raw, dtype=np.uint8).reshape((msg.height, msg.width, 3))
-                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                elif "rgb8" in enc:
-                    rgb = np.frombuffer(raw, dtype=np.uint8).reshape((msg.height, msg.width, 3)).copy()
-                else:
-                    rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
-
-                with self.lock:
-                    self._ts_camera.append(now)
-                    self.latest_color_raw = rgb
-                    self.latest_color_stamp = sec
-
-                    # Save Keyframe if recording (skip blurred frames during rapid turns)
-                    if self.is_session_recording and self.current_ang_speed <= self.max_turn_rate_rad_s:
-                        pose = self.get_interpolated_odom(sec)
-                        if pose is not None:
-                            pos_w, quat = pose
-                            R_w_imu = Rotation.from_quat(quat).as_matrix()
-                            if len(self.rgb_keyframes) == 0 or (sec - self.rgb_keyframes[-1][0] >= 0.20):
-                                self.rgb_keyframes.append((sec, rgb, R_w_imu, pos_w))
-
-                emit_composite_camera_frame()
-            except Exception:
-                pass
+            raw = bytes(msg.data)
+            with self.lock:
+                self._ts_camera.append(now)
+                self._raw_rgb_queue.append(
+                    (sec, now, int(msg.width), int(msg.height), int(msg.step), msg.encoding.lower(), raw)
+                )
 
         def depth_callback(msg: Image):
+            """Ultra-fast (<0.15ms) non-blocking Depth ingestion."""
             now = time.time()
             sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             self.last_depth_time = now
-
-            try:
-                raw = bytes(msg.data)
-                depth_img = np.frombuffer(raw, dtype=np.uint16).reshape((msg.height, msg.width))
-                with self.lock:
-                    self._ts_depth.append(now)
-                    self.latest_depth_raw = depth_img
-                    self.latest_depth_stamp = sec
-                    min_d = self.depth_min_m
-                    max_d = self.depth_max_m
-                    agree_tol = self.surface_agreement_m
-                    ang_speed = self.current_ang_speed
-                    d_rgb = self.d_rgb
-
-                emit_composite_camera_frame()
-
-                # Angular-Velocity Motion Blur & Smear Gate: skip stereo depth map fusion during rapid turns
-                if ang_speed > self.max_turn_rate_rad_s:
-                    with self.lock:
-                        self.cnt_depth_gated_turn += 1
-                    return
-
-                # Throttle heavy 3D unprojection & KD-Tree agreement gating (Max 5 Hz recording, 3 Hz idle)
-                voxel_interval = 0.20 if self.is_session_recording else 0.35
-                if (now - self._last_depth_voxel_time) < voxel_interval:
-                    return
-                self._last_depth_voxel_time = now
-
-                # Unproject Subsampled Depth for Live Observability & Recording
-                sub = 16 # Fast 16x subsampling for real-time live HUD
-                d_sub = depth_img[::sub, ::sub]
-                v_idx, u_idx = np.nonzero((d_sub >= int(min_d * 1000)) & (d_sub <= int(max_d * 1000)))
-                if len(u_idx) == 0:
-                    return
-
-                pose = self.get_interpolated_odom(sec)
-                if pose is None:
-                    return
-
-                pos_w, quat = pose
-                R_w_imu = Rotation.from_quat(quat).as_matrix()
-                R_w_cam_depth = R_w_imu @ R_IMU_CAM_DEPTH
-                t_w_cam_depth = R_w_imu @ t_IMU_CAM_DEPTH + pos_w
-
-                u_px = u_idx * sub
-                v_px = v_idx * sub
-                z_vals = d_sub[v_idx, u_idx] * 0.001 # m
-
-                x_cam = (u_px - self.cx_d) * z_vals / self.fx_d
-                y_cam = (v_px - self.cy_d) * z_vals / self.fy_d
-                pts_cam = np.vstack((x_cam, y_cam, z_vals)).T
-                pts_w = pts_cam @ R_w_cam_depth.T + t_w_cam_depth
-
-                # Color projection with Plumb-Bob distortion
-                with self.lock:
-                    rgb_img = self.latest_color_raw
-                    rgb_stamp = self.latest_color_stamp
-
-                colors = np.full((len(pts_w), 3), 175, dtype=np.uint8)
-                if rgb_img is not None and abs(sec - rgb_stamp) <= 0.10:
-                    rgb_h, rgb_w = rgb_img.shape[:2]
-                    pts_rgb_frame = (pts_cam @ R_RGB_CAM_DEPTH.T) + t_RGB_CAM_DEPTH
-                    u_r, v_r, zr = project_pts_to_rgb_plumb_bob(
-                        pts_rgb_frame, self.fx_rgb, self.fy_rgb, self.cx_rgb, self.cy_rgb, d_rgb
-                    )
-                    in_fov = (zr > 0.2) & (u_r >= 0) & (u_r < rgb_w) & (v_r >= 0) & (v_r < rgb_h)
-                    if np.any(in_fov):
-                        colors[in_fov] = rgb_img[v_r[in_fov], u_r[in_fov]]
-
-                # Multi-Factor Agreement Gating against Airy Cloud
-                is_accepted = np.ones(len(pts_w), dtype=bool)
-                with self.lock:
-                    airy_sample_keys = list(self.live_airy_voxels.keys())
-                    if len(airy_sample_keys) > 50:
-                        step_a = max(1, len(airy_sample_keys) // 2000)
-                        airy_pts_arr = np.array([self.live_airy_voxels[k][:3] for k in airy_sample_keys[::step_a]])
-                    else:
-                        airy_pts_arr = None
-
-                if airy_pts_arr is not None:
-                    tree_a = cKDTree(airy_pts_arr)
-                    dists, _ = tree_a.query(pts_w, k=1, workers=1)
-                    # Gating: 0.3-2.0m accepted freely; 2.0-4.0m requires distance agreement <= agree_tol
-                    near_mask = z_vals <= 2.0
-                    mid_mask = (z_vals > 2.0) & (z_vals <= max_d)
-                    is_accepted = near_mask | (mid_mask & (dists <= agree_tol))
-
-                # Pre-reduce to unique 5cm voxels in NumPy before acquiring lock
-                voxel_size = 0.05
-                gx = np.floor(pts_w[:, 0] / voxel_size).astype(np.int64)
-                gy = np.floor(pts_w[:, 1] / voxel_size).astype(np.int64)
-                gz = np.floor(pts_w[:, 2] / voxel_size).astype(np.int64)
-                packed = ((gx + 500000) << 42) | ((gy + 500000) << 21) | (gz + 500000)
-                _, u_vox = np.unique(packed, return_index=True)
-
-                with self.lock:
-                    for i in u_vox:
-                        key = (int(gx[i]), int(gy[i]), int(gz[i]))
-                        self.live_stereo_voxels[key] = [
-                            float(pts_w[i, 0]), float(pts_w[i, 1]), float(pts_w[i, 2]),
-                            int(colors[i, 0]), int(colors[i, 1]), int(colors[i, 2]),
-                            bool(is_accepted[i])
-                        ]
-                    if self.is_session_recording:
-                        self.gemini_frames.append((sec, pts_w, colors))
-
-            except Exception:
-                pass
+            raw = bytes(msg.data)
+            item = (sec, now, int(msg.width), int(msg.height), int(msg.step), msg.encoding.lower(), raw)
+            with self.lock:
+                self._ts_depth.append(now)
+                self._latest_raw_depth_tuple = item
+                self._raw_depth_queue.append(item)
 
         def registered_cloud_callback(msg: PointCloud2):
-            """Processes Authoritative FAST-LIVO2 Registered Cloud & Computes Elevation Distribution."""
+            """Ultra-fast (<0.2ms) non-blocking FAST-LIVO2 Registered Cloud ingestion."""
             self.cnt_lidar += 1
+            self.cnt_rslidar += 1
             now = time.time()
             sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             self.last_lidar_time = now
-
-            try:
-                with self.lock:
-                    self._ts_lidar.append(now)
-
-                num_points = msg.width * msg.height
-                if num_points == 0 or msg.point_step < 12:
-                    return
-
-                raw = bytes(msg.data)
-                if len(raw) < num_points * msg.point_step:
-                    return
-                dt = np.dtype({
-                    'names': ['x', 'y', 'z'],
-                    'formats': ['<f4', '<f4', '<f4'],
-                    'offsets': [0, 4, 8],
-                    'itemsize': msg.point_step
-                })
-                pts = np.frombuffer(raw, dtype=dt, count=num_points)
-                valid = np.isfinite(pts['x']) & np.isfinite(pts['y']) & np.isfinite(pts['z'])
-                pts_valid = pts[valid]
-                if len(pts_valid) == 0:
-                    return
-
-                xyz_w = np.column_stack((pts_valid['x'], pts_valid['y'], pts_valid['z'])).astype(np.float64)
-
-                # 1. Compute Live Beam Angular Elevation Distribution in Sensor Body Frame
-                pose = self.get_interpolated_odom(sec)
-                if pose is not None:
-                    pos_w, quat = pose
-                    R_w_imu = Rotation.from_quat(quat).as_matrix()
-                    p_body = (xyz_w - pos_w) @ R_w_imu
-                    norm_xy = np.linalg.norm(p_body[:, :2], axis=1)
-                    elev_deg = np.degrees(np.arctan2(p_body[:, 2], np.maximum(0.01, norm_xy)))
-
-                    floor_cnt = int(np.sum(elev_deg < -30.0))
-                    wall_cnt = int(np.sum((elev_deg >= -30.0) & (elev_deg <= 30.0)))
-                    ceil_cnt = int(np.sum(elev_deg > 30.0))
-                    total_cnt = len(elev_deg)
-
-                    with self.lock:
-                        self.live_elevation_stats = {
-                            "floor": floor_cnt,
-                            "wall": wall_cnt,
-                            "ceiling": ceil_cnt,
-                            "total": total_cnt
-                        }
-
-                # 2. Pre-reduce sweep to unique 5cm voxels in NumPy outside the lock
-                voxel_size = 0.05
-                gx_all = np.floor(xyz_w[:, 0] / voxel_size).astype(np.int64)
-                gy_all = np.floor(xyz_w[:, 1] / voxel_size).astype(np.int64)
-                gz_all = np.floor(xyz_w[:, 2] / voxel_size).astype(np.int64)
-                packed = ((gx_all + 500000) << 42) | ((gy_all + 500000) << 21) | (gz_all + 500000)
-                _, u_idx = np.unique(packed, return_index=True)
-
-                xyz_u = xyz_w[u_idx]
-                gx = gx_all[u_idx]
-                gy = gy_all[u_idx]
-                gz = gz_all[u_idx]
-
-                # Check observation state & sample true RGB colors against latest camera frame
-                with self.lock:
-                    rgb_img = self.latest_color_raw
-                    rgb_stamp = self.latest_color_stamp
-                    d_rgb = self.d_rgb
-                    stereo_keys = set(self.live_stereo_voxels.keys())
-                rgb_w_pose = self.get_interpolated_odom(rgb_stamp) if rgb_img is not None else None
-
-                obs_states = np.zeros(len(xyz_u), dtype=np.uint8) # 0=Unobserved, 1=RGB, 2=Depth, 3=Both
-                vox_colors = np.zeros((len(xyz_u), 3), dtype=np.uint8)
-                vox_colors[:, 0] = 56
-                vox_colors[:, 1] = 217
-                vox_colors[:, 2] = 169
-
-                if rgb_img is not None and rgb_w_pose is not None:
-                    pos_c, quat_c = rgb_w_pose
-                    R_w_imu_c = Rotation.from_quat(quat_c).as_matrix()
-                    p_imu_c = (xyz_u - pos_c) @ R_w_imu_c
-                    p_lid_c = (p_imu_c - t_IMU_LIDAR) @ R_IMU_LIDAR
-                    p_rgb_c = p_lid_c @ R_RGB_LIDAR.T + t_RGB_LIDAR
-                    u, v, zr = project_pts_to_rgb_plumb_bob(
-                        p_rgb_c, self.fx_rgb, self.fy_rgb, self.cx_rgb, self.cy_rgb, d_rgb
-                    )
-                    rgb_h, rgb_w = rgb_img.shape[:2]
-                    in_rgb_fov = (zr > 0.3) & (zr < 6.0) & (u >= 0) & (u < rgb_w) & (v >= 0) & (v < rgb_h)
-                    if np.any(in_rgb_fov):
-                        obs_states[in_rgb_fov] = 1
-                        vox_colors[in_rgb_fov] = rgb_img[v[in_rgb_fov], u[in_rgb_fov]]
-
-                with self.lock:
-                    for i in range(len(xyz_u)):
-                        key = (int(gx[i]), int(gy[i]), int(gz[i]))
-                        has_stereo_match = key in stereo_keys
-                        state = int(obs_states[i])
-                        r_c, g_c, b_c = int(vox_colors[i, 0]), int(vox_colors[i, 1]), int(vox_colors[i, 2])
-
-                        # Preserve previously painted RGB color & observation flag if voxel was already observed
-                        prev = self.live_airy_voxels.get(key)
-                        if prev is not None and state == 0 and prev[6] in (1, 3):
-                            state = 1
-                            r_c, g_c, b_c = prev[3], prev[4], prev[5]
-
-                        if has_stereo_match:
-                            state = 3 if state in (1, 3) else 2
-
-                        self.live_airy_voxels[key] = [
-                            float(xyz_u[i, 0]), float(xyz_u[i, 1]), float(xyz_u[i, 2]),
-                            r_c, g_c, b_c, state
-                        ]
-
-                    if self.is_session_recording:
-                        self.airy_sweeps.append((sec, xyz_w))
-
-            except Exception:
-                pass
+            self.last_rslidar_time = now
+            num_points = int(msg.width * msg.height)
+            step = int(msg.point_step)
+            raw = bytes(msg.data)
+            with self.lock:
+                self._ts_lidar.append(now)
+                self._ts_rslidar.append(now)
+                if num_points > 0 and step >= 12 and len(raw) >= num_points * step:
+                    self._raw_lidar_queue.append((sec, num_points, step, raw))
 
         def slam_odom_callback(msg: Odometry):
+            """Immediate 10 Hz low-latency 6-DoF SLAM pose callback."""
             self.cnt_slam += 1
             now = time.time()
             sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -1278,23 +1749,41 @@ class Ros2BridgeWorker(QThread):
             self.current_y = py
             self.current_z = pz
             self.current_quat = [qx, qy, qz, qw]
-            siny_cosp = 2.0 * (qw * qz + qx * qy)
-            cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-            self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+            try:
+                R_w_imu = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+                fwd_w = R_w_imu @ CAM_FWD_AXIS_IMU
+                self.current_yaw = math.atan2(fwd_w[1], fwd_w[0])
+            except Exception:
+                siny_cosp = 2.0 * (qw * qz + qx * qy)
+                cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+                self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
             pos_arr = np.array([px, py, pz], dtype=np.float64)
             quat_arr = np.array([qx, qy, qz, qw], dtype=np.float64)
+            q_norm = float(np.linalg.norm(quat_arr))
+            if q_norm > 1e-6:
+                quat_arr = quat_arr / q_norm
 
             with self.lock:
                 self._ts_slam.append(now)
+                if sec > 1.0:
+                    raw_off = sec - now
+                    if not self._has_slam_clock_offset:
+                        self._slam_wall_to_stamp_offset = raw_off
+                        self._has_slam_clock_offset = True
+                    else:
+                        self._slam_wall_to_stamp_offset = 0.85 * self._slam_wall_to_stamp_offset + 0.15 * raw_off
+                self._pred_yaw = self.current_yaw
+                self._last_imu_pred_time = now
+
                 if len(self.odom_buffer) > 0:
                     prev_t, prev_p, prev_q = self.odom_buffer[-1]
                     dt = sec - prev_t
-                    if 0.005 < dt < 1.0:
+                    if 0.025 < dt < 1.0:
                         lin_spd = float(np.linalg.norm(pos_arr - prev_p) / dt)
                         dot_q = abs(float(np.dot(quat_arr, prev_q)))
                         ang_diff = 2.0 * math.acos(min(1.0, max(0.0, dot_q)))
-                        ang_spd = float(ang_diff / dt)
+                        ang_spd = min(6.0, float(ang_diff / dt))
                         self.current_lin_speed = 0.6 * self.current_lin_speed + 0.4 * lin_spd
                         self.current_ang_speed = 0.6 * self.current_ang_speed + 0.4 * ang_spd
                 self.odom_buffer.append((sec, pos_arr, quat_arr))
@@ -1303,48 +1792,146 @@ class Ros2BridgeWorker(QThread):
 
             self.pose_received.emit(self.current_x, self.current_y, self.current_yaw)
 
-        def rslidar_callback(msg: PointCloud2):
-            """Fast lightweight hardware LiDAR rate tracker directly off /rslidar_points."""
-            self.cnt_rslidar += 1
+        def rslidar_imu_liveness_callback(msg: Imu):
+            """
+            1. Lightweight hardware LiDAR liveness fallback (before SLAM starts) without 3MB PointCloud2 copy.
+            2. High-precision Stage 1 static gravity calibration and Stage 2 90° rotation ritual integration.
+            3. Zero-latency 35 Hz inter-sweep IMU gyro heading prediction between 10 Hz SLAM poses.
+            """
             now = time.time()
-            self.last_rslidar_time = now
-            with self.lock:
-                self._ts_rslidar.append(now)
+            if (now - self.last_lidar_time) > 0.5 and (now - self.last_rslidar_time) >= 0.098:
+                self.cnt_rslidar += 1
+                self.last_rslidar_time = now
+                with self.lock:
+                    self._ts_rslidar.append(now)
 
-        # Topic Subscriptions
-        node.create_subscription(PointCloud2, "/rslidar_points", rslidar_callback, qos_profile_sensor_data)
-        node.create_subscription(Image, "/camera/color/image_raw", rgb_color_callback, qos_profile_sensor_data)
-        node.create_subscription(Image, "/camera/depth/image_raw", depth_callback, qos_profile_sensor_data)
-        node.create_subscription(CameraInfo, "/camera/color/camera_info", rgb_info_callback, qos_profile_sensor_data)
-        node.create_subscription(CameraInfo, "/camera/depth/camera_info", depth_info_callback, qos_profile_sensor_data)
-        node.create_subscription(PointCloud2, "/cloud_registered", registered_cloud_callback, qos_profile_sensor_data)
-        node.create_subscription(Odometry, "/aft_mapped_to_init", slam_odom_callback, qos_profile_sensor_data)
+            ax = float(msg.linear_acceleration.x)
+            ay = float(msg.linear_acceleration.y)
+            az = float(msg.linear_acceleration.z)
+            if math.isfinite(ax) and math.isfinite(ay) and math.isfinite(az):
+                self.last_ax = ax
+                self.last_ay = ay
+                self.last_az = az
 
-        # Dedicated ROS 2 Spin Thread to ensure zero callback starvation
-        self.ros_node = node
+            # NavVis 90-Degree Rotation Ritual Tracking
+            if self.in_rotation_ritual:
+                now_t = now
+                if self.last_imu_gyro_time is not None:
+                    dt_rot = now_t - self.last_imu_gyro_time
+                    if 0.0 < dt_rot < 0.5:
+                        gx = float(msg.angular_velocity.x)
+                        gy = float(msg.angular_velocity.y)
+                        gz = float(msg.angular_velocity.z)
+                        # Project angular velocity along gravity axis (or total gyro magnitude)
+                        acc_norm = math.hypot(self.last_ax, self.last_ay, self.last_az)
+                        if acc_norm > 1.0:
+                            gz_eff = abs(gx * self.last_ax + gy * self.last_ay + gz * self.last_az) / acc_norm
+                        else:
+                            gz_eff = math.hypot(gx, gy, gz)
+                        gz_deg = gz_eff * (180.0 / math.pi)
+                        if gz_deg > 3.0:  # Threshold to filter hand tremor
+                            self.accumulated_rotation_deg += gz_deg * dt_rot
+                            self.rotation_progress_received.emit(self.accumulated_rotation_deg)
+                            if self.accumulated_rotation_deg >= 85.0 and gz_deg < 25.0:
+                                self.in_rotation_ritual = False
+                                self.rotation_completed_received.emit()
+                self.last_imu_gyro_time = now_t
+
+            if self.using_slam_odom and (now - self.last_slam_time) < 0.35:
+                dt_imu = now - self._last_imu_pred_time if self._last_imu_pred_time > 0 else 0.0
+                self._last_imu_pred_time = now
+                if 0.001 <= dt_imu <= 0.05:
+                    gx = float(msg.angular_velocity.x)
+                    gy = float(msg.angular_velocity.y)
+                    gz = float(msg.angular_velocity.z)
+                    try:
+                        R_w_imu = Rotation.from_quat(self.current_quat).as_matrix()
+                        w_world = R_w_imu @ np.array([gx, gy, gz], dtype=np.float64)
+                        wz_world = float(w_world[2])
+                    except Exception:
+                        wz_world = gz
+
+                    if math.isfinite(wz_world) and abs(wz_world) > 0.015:
+                        with self.lock:
+                            self._pred_yaw = math.atan2(
+                                math.sin(self._pred_yaw + wz_world * dt_imu),
+                                math.cos(self._pred_yaw + wz_world * dt_imu),
+                            )
+                            pred_yaw = self._pred_yaw
+                        if (now - self._last_imu_emit_time) >= 0.028:  # ~35 Hz smooth heading updates
+                            self._last_imu_emit_time = now
+                            self.pose_received.emit(self.current_x, self.current_y, pred_yaw)
+
+        # Match RELIABLE QoS of orbbec_camera (`color_qos=default`) & fastlivo_mapping (`/cloud_registered`, `/aft_mapped_to_init`)
+        # so 3 MB RGB and 2.5 MB PointCloud2 payloads use FastDDS Shared Memory without BEST_EFFORT frame drops.
+        qos_reliable_stream = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        # Depth=1 BEST_EFFORT for 200 Hz IMU so at most 1 IMU callback runs per wait-set wake
+        qos_imu_single = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+
+        node.create_subscription(Image, "/camera/color/image_raw", rgb_color_callback, qos_reliable_stream)
+        node.create_subscription(Image, "/camera/depth/image_raw", depth_callback, qos_reliable_stream)
+        node.create_subscription(CameraInfo, "/camera/color/camera_info", rgb_info_callback, qos_reliable_stream)
+        node.create_subscription(CameraInfo, "/camera/depth/camera_info", depth_info_callback, qos_reliable_stream)
+        node.create_subscription(PointCloud2, "/cloud_registered", registered_cloud_callback, qos_reliable_stream)
+        node.create_subscription(Odometry, "/aft_mapped_to_init", slam_odom_callback, qos_reliable_stream)
+        node.create_subscription(Imu, "/rslidar_imu_data", rslidar_imu_liveness_callback, qos_imu_single)
+
+        # Single persistent SingleThreadedExecutor (preserves round-robin `_cb_iter` across spin_once calls)
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
+
         def spin_ros():
             while self.running and rclpy.ok():
                 try:
-                    rclpy.spin_once(node, timeout_sec=0.02)
+                    executor.spin_once(timeout_sec=0.005)
                 except Exception:
-                    time.sleep(0.01)
+                    time.sleep(0.002)
+
+        def run_camera_preview_loop():
+            while self.running and rclpy.ok():
+                try:
+                    self._drain_and_emit_camera_preview()
+                except Exception:
+                    pass
+                time.sleep(0.025)
 
         spin_thread = threading.Thread(target=spin_ros, daemon=True, name="ROS2_Spin_Thread")
+        preview_thread = threading.Thread(target=run_camera_preview_loop, daemon=True, name="Camera_Preview_Thread")
         spin_thread.start()
+        preview_thread.start()
 
-        # Periodic UI Telemetry & Point Slicing Loop (10 Hz)
+        # High-Rate Background 3D Map Processing & UI Dispatch Loop (~50 Hz queue drain, ~12.5 Hz map update)
         last_emit_time = 0.0
         while self.running and rclpy.ok():
+            try:
+                self._process_pending_sensor_queues()
+            except Exception:
+                pass
             now = time.time()
-            if now - last_emit_time >= 0.10: # 10 Hz UI Update Loop
+            if now - last_emit_time >= 0.08:  # 12.5 Hz smooth Map & Telemetry update
                 last_emit_time = now
                 try:
                     self.dispatch_live_map_and_telemetry()
                 except Exception:
                     pass
-            time.sleep(0.02)
+            time.sleep(0.015)
 
-        node.destroy_node()
+        try:
+            executor.shutdown()
+        except Exception:
+            pass
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
 
     def _compute_rate(self, ts_deque, now, window=3.5):
         while len(ts_deque) > 0 and (now - ts_deque[0]) > window:
@@ -1354,13 +1941,12 @@ class Ros2BridgeWorker(QThread):
         span = max(0.2, ts_deque[-1] - ts_deque[0])
         return (len(ts_deque) - 1) / span
 
-    def dispatch_live_map_and_telemetry(self):
-        """Prepares sliced points (with M12 Real-Time Cleanup & C-SLAM Multi-Scanner Merge) and live telemetry for HUD map visualization."""
+    def dispatch_live_map_and_telemetry(self, force: bool = False):
+        """Prepares sliced points and live telemetry at 12.5 Hz with zero Python list conversion overhead."""
         now = time.time()
         with self.lock:
             mode = self.display_mode
-            airy_dict = dict(self.live_airy_voxels)
-            stereo_dict = dict(self.live_stereo_voxels)
+            a_arr, s_arr = self._get_voxel_arrays_locked()
             elev_stats = dict(self.live_elevation_stats)
             rslidar_hz = self._compute_rate(self._ts_rslidar, now)
             lidar_hz = self._compute_rate(self._ts_lidar, now)
@@ -1385,18 +1971,30 @@ class Ros2BridgeWorker(QThread):
             stats_snap = self.last_cleanup_stats
             rt_ms = self.live_cleanup_time_ms
 
-        n_airy = len(airy_dict)
-        n_stereo = len(stereo_dict)
+        n_airy = len(a_arr)
+        n_stereo = len(s_arr)
 
-        # Calculate Telemetry Metrics
-        n_rgb_obs = sum(1 for v in airy_dict.values() if v[6] in (1, 3))
-        n_dual_obs = sum(1 for v in airy_dict.values() if v[6] == 3)
-        rgb_cov_pct = (n_rgb_obs / max(1, n_airy)) * 100.0 if n_airy > 0 else 0.0
-        dual_cov_pct = (n_dual_obs / max(1, n_airy)) * 100.0 if n_airy > 0 else 0.0
+        # Vectorized Telemetry Metrics (<0.05ms)
+        if n_airy > 0:
+            st_col = np.rint(a_arr[:, 6]).astype(np.int32)
+            n_rgb_obs = int(np.sum((st_col == 1) | (st_col == 3)))
+            n_dual_obs = int(np.sum(st_col == 3))
+            rgb_cov_pct = (n_rgb_obs / n_airy) * 100.0
+            dual_cov_pct = (n_dual_obs / n_airy) * 100.0
+        else:
+            n_rgb_obs = 0
+            n_dual_obs = 0
+            rgb_cov_pct = 0.0
+            dual_cov_pct = 0.0
 
-        n_accepted = sum(1 for v in stereo_dict.values() if v[6])
-        n_rejected = n_stereo - n_accepted
-        stereo_accept_pct = (n_accepted / max(1, n_stereo)) * 100.0 if n_stereo > 0 else 0.0
+        if n_stereo > 0:
+            n_accepted = int(np.sum(s_arr[:, 6] > 0.5))
+            n_rejected = n_stereo - n_accepted
+            stereo_accept_pct = (n_accepted / n_stereo) * 100.0
+        else:
+            n_accepted = 0
+            n_rejected = 0
+            stereo_accept_pct = 0.0
 
         # Elevation Breakdown %
         t_elev = max(1, elev_stats.get("total", 1))
@@ -1444,11 +2042,13 @@ class Ros2BridgeWorker(QThread):
         }
         self.telemetry_updated.emit(telemetry)
 
-        # Throttle heavy point extraction, M12 cleanup, C-SLAM merge, and map display to max ~3.3 Hz (every 0.30s)
+        # Smooth 10-12.5 Hz Map Refresh (0.08s interval) or immediate forced redraw on layer button click
         should_refresh_map = (
+            force or
             preview_on or
             self._cached_map_points_data is None or
-            (now - self._last_map_dispatch_time >= 0.30)
+            self._cached_map_points_data.get("mode") != mode or
+            (now - self._last_map_dispatch_time >= 0.08)
         )
         if not should_refresh_map:
             return
@@ -1459,7 +2059,7 @@ class Ros2BridgeWorker(QThread):
         if preview_on and preview_pts is not None:
             active_local_3d = preview_pts
         else:
-            active_local_3d = self.extract_raw_3d_points_for_mode(mode, list(airy_dict.values()), list(stereo_dict.values()))
+            active_local_3d = self.extract_raw_3d_points_for_mode(mode, a_arr, s_arr)
             if live_clean_on and len(active_local_3d) > 20:
                 rt_params = CleanupParams(
                     enable_voxel_downsample=m12_cfg.enable_voxel_downsample,
@@ -1488,67 +2088,66 @@ class Ros2BridgeWorker(QThread):
         except Exception:
             imu_rpy = (0.0, 0.0, self.current_yaw)
 
+        # Always feed authoritative fused cloud to C-SLAM network broadcast while displaying `active_local_3d` locally
         if len(active_local_3d) > 0:
             local_norm = active_local_3d.copy()
             if np.max(local_norm[:, 3:6]) > 1.05:
                 local_norm[:, 3:6] /= 255.0
-            self.cslam_engine.update_local_state(
-                points_xyz_rgb=local_norm,
-                pos_xyz=(cur_x, cur_y, cur_z),
-                imu_rpy_rad=imu_rpy,
-            )
+            if mode in ("colorized_fused", "fused", "airy_only"):
+                self.cslam_engine.update_local_state(
+                    points_xyz_rgb=local_norm,
+                    pos_xyz=(cur_x, cur_y, cur_z),
+                    imu_rpy_rad=imu_rpy,
+                )
         else:
             local_norm = np.zeros((0, 6), dtype=np.float32)
 
         merged_3d, peer_descriptors = self.cslam_engine.get_merged_cslam_scene(
-            local_points_override=local_norm
+            local_points_override=local_norm,
+            preserve_local_colors=(mode != "colorized_fused"),
         )
 
-        if len(merged_3d) == 0 and len(peer_descriptors) == 0:
-            return
-
-        # Extract 2D Slice + 3D Studio Cloud from Merged 3D Scene
-        display_pts = []
-        pts_3d_list = []
+        # Extract 2D Floorplan Slice as contiguous float32 NumPy array (N, 5) [wx, wy, r, g, b]
+        # Crisp eye-level horizontal cross-section cleanly isolates vertical walls without floor/ceiling fog.
+        display_pts = np.zeros((0, 5), dtype=np.float32)
         if len(merged_3d) > 0:
-            if len(merged_3d) > 15000:
-                stride_3d = max(1, len(merged_3d) // 15000)
-                cloud_3d_sub = merged_3d[::stride_3d]
-            else:
-                cloud_3d_sub = merged_3d
-            rgb_scale_3d = 255.0 if np.max(cloud_3d_sub[:, 3:6]) <= 1.05 else 1.0
-            pts_3d_arr = np.column_stack([
-                cloud_3d_sub[:, 0],
-                cloud_3d_sub[:, 1],
-                cloud_3d_sub[:, 2],
-                np.clip(cloud_3d_sub[:, 3] * rgb_scale_3d, 0, 255),
-                np.clip(cloud_3d_sub[:, 4] * rgb_scale_3d, 0, 255),
-                np.clip(cloud_3d_sub[:, 5] * rgb_scale_3d, 0, 255),
-            ])
-            pts_3d_list = pts_3d_arr.tolist()
-
             rel_z = merged_3d[:, 2] - cur_z
-            mask_slice = (rel_z >= -0.60) & (rel_z <= 1.80)
+            if mode == "airy_only":
+                mask_slice = (rel_z >= -0.30) & (rel_z <= 0.35)
+            elif mode == "stereo_only":
+                mask_slice = (rel_z >= -0.75) & (rel_z <= 0.35)
+            else:
+                mask_slice = (rel_z >= -0.35) & (rel_z <= 0.35)
+
             sliced = merged_3d[mask_slice]
+            if len(sliced) == 0:
+                med_z = float(np.median(merged_3d[:, 2]))
+                mask_slice = (merged_3d[:, 2] >= med_z - 0.25) & (merged_3d[:, 2] <= med_z + 0.25)
+                sliced = merged_3d[mask_slice]
             if len(sliced) == 0:
                 sliced = merged_3d
 
-            if len(sliced) > 30000:
-                stride = max(1, len(sliced) // 30000)
+            if len(sliced) > 35000:
+                stride = max(1, len(sliced) // 35000)
                 sliced = sliced[::stride]
 
             rgb_scale = 255.0 if np.max(sliced[:, 3:6]) <= 1.05 else 1.0
-            wx_arr = sliced[:, 0]
-            wy_arr = sliced[:, 1]
-            r_arr = np.clip(sliced[:, 3] * rgb_scale, 0, 255)
-            g_arr = np.clip(sliced[:, 4] * rgb_scale, 0, 255)
-            b_arr = np.clip(sliced[:, 5] * rgb_scale, 0, 255)
-            display_pts = np.column_stack([wx_arr, wy_arr, r_arr, g_arr, b_arr]).tolist()
+            display_pts = np.empty((len(sliced), 5), dtype=np.float32)
+            display_pts[:, 0] = sliced[:, 0]
+            display_pts[:, 1] = sliced[:, 1]
+            display_pts[:, 2] = np.clip(sliced[:, 3] * rgb_scale, 0, 255)
+            display_pts[:, 3] = np.clip(sliced[:, 4] * rgb_scale, 0, 255)
+            display_pts[:, 4] = np.clip(sliced[:, 5] * rgb_scale, 0, 255)
 
         payload = {
             "points": display_pts,
-            "points_3d": pts_3d_list,
+            "points_3d": [],
             "mode": mode,
+            "n_airy": n_airy,
+            "n_stereo": n_stereo,
+            "n_accepted": n_accepted,
+            "n_rejected": n_rejected,
+            "n_rgb_obs": n_rgb_obs,
             "peers": peer_descriptors,
             "local_color_hex": cslam_summary["local_color_hex"],
             "cslam_color_mode": cslam_summary["color_mode"],
@@ -1562,18 +2161,27 @@ class Ros2BridgeWorker(QThread):
         with self.lock:
             self.live_airy_voxels.clear()
             self.live_stereo_voxels.clear()
+            self._airy_cache_dirty = True
+            self._stereo_cache_dirty = True
+            self.cleanup_preview_active = False
+            self.cleanup_preview_points = None
             self.trajectory_records.clear()
             self.airy_sweeps.clear()
             self.gemini_frames.clear()
             self.rgb_keyframes.clear()
+            self._raw_rgb_queue.clear()
+            self._raw_depth_queue.clear()
+            self._raw_lidar_queue.clear()
             self.cnt_depth_gated_turn = 0
             self.session_start_epoch = time.time()
             self.is_session_recording = True
+        self.cslam_engine.set_recording_active(True)
 
     def stop_recording_session(self):
         with self.lock:
             self.is_session_recording = False
             self.session_duration = time.time() - self.session_start_epoch if self.session_start_epoch > 0 else 0.0
+        self.cslam_engine.set_recording_active(False)
 
     def export_production_dataset(self, save_dir, dataset_name, trajectory, flash_anchors):
         """Exports Qualified Production Bundle (Airy Pure XYZ, Stereo XYZ+RGB, Fused XYZ+RGB, plus M12 & C-SLAM Merged)."""
@@ -1660,8 +2268,8 @@ class Ros2BridgeWorker(QThread):
         if len(airy_clean) > 0 and len(stereo_clean_xyz) > 0:
             tree_a = cKDTree(airy_clean)
             dists, _ = tree_a.query(stereo_clean_xyz, k=1, workers=-1)
-            mask_snap = dists <= 0.020
-            mask_supp = dists > 0.080
+            mask_snap = dists <= 0.025
+            mask_supp = dists > 0.025
             fused_xyz = np.vstack((airy_clean, stereo_clean_xyz[mask_snap], stereo_clean_xyz[mask_supp]))
             fused_rgb = np.vstack((airy_rgb, stereo_clean_rgb[mask_snap], stereo_clean_rgb[mask_supp]))
         else:
@@ -1866,16 +2474,18 @@ class RealityCaptureMapCanvas(QFrame):
         )
 
         self.trajectory_path = []
-        self.rendered_points = []  # list of (wx, wy, r, g, b)
+        self.rendered_points = np.zeros((0, 5), dtype=np.float32)  # contiguous (N, 5) [wx, wy, r, g, b]
         self.peer_descriptors = []  # list of C-SLAM peer status/pose/trajectory dicts
         self.current_mode = "colorized_fused"
-        self.m12_live_enabled = True
+        self.m12_live_enabled = False
         self.m12_preview_active = False
         self.cslam_color_mode = "SCANNER_COLORS"
         self.flash_anchors = []
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_yaw = 0.0
+        self.gravity_roll_deg = 0.0
+        self.gravity_pitch_deg = 0.0
         self.view_radius_m = 25.0
         self.scale = 10.0
         self.total_distance = 0.0
@@ -1903,20 +2513,43 @@ class RealityCaptureMapCanvas(QFrame):
 
     def clear_map(self):
         with self._map_lock:
-            self.rendered_points.clear()
+            self.rendered_points = np.zeros((0, 5), dtype=np.float32)
             self.trajectory_path.clear()
             self.flash_anchors.clear()
         self.total_distance = 0.0
         self.update()
 
-    def update_map_points(self, data: dict):
+    def add_flash_anchor(self, label: str, x: float, y: float, z: float = 0.0):
         with self._map_lock:
-            self.rendered_points = data.get("points", [])
+            self.flash_anchors.append({
+                "label": label,
+                "x": float(x),
+                "y": float(y),
+                "z": float(z),
+                "time": time.time(),
+            })
+        self.update()
+
+    def update_map_points(self, data: dict):
+        pts = data.get("points", None)
+        if pts is None:
+            pts_arr = np.zeros((0, 5), dtype=np.float32)
+        elif isinstance(pts, np.ndarray):
+            pts_arr = pts
+        else:
+            pts_arr = np.asarray(pts, dtype=np.float32) if len(pts) > 0 else np.zeros((0, 5), dtype=np.float32)
+        with self._map_lock:
+            self.rendered_points = pts_arr
             self.current_mode = data.get("mode", "colorized_fused")
             self.peer_descriptors = data.get("peers", [])
-            self.m12_live_enabled = data.get("m12_live_enabled", True)
+            self.m12_live_enabled = data.get("m12_live_enabled", False)
             self.m12_preview_active = data.get("m12_preview_active", False)
             self.cslam_color_mode = data.get("cslam_color_mode", "SCANNER_COLORS")
+        self.update()
+
+    def set_active_mode_immediate(self, mode_key: str):
+        with self._map_lock:
+            self.current_mode = mode_key
         self.update()
 
     def update_pose(self, x: float, y: float, yaw: float):
@@ -1974,8 +2607,9 @@ class RealityCaptureMapCanvas(QFrame):
             def world_to_screen(wx, wy):
                 dx = wx - self.current_x
                 dy = wy - self.current_y
-                cos_y = math.cos(-self.current_yaw - math.pi / 2)
-                sin_y = math.sin(-self.current_yaw - math.pi / 2)
+                rot_ang = (math.pi / 2.0) - self.current_yaw
+                cos_y = math.cos(rot_ang)
+                sin_y = math.sin(rot_ang)
                 rx = dx * cos_y - dy * sin_y
                 ry = dx * sin_y + dy * cos_y
                 sx = int(cx + (rx * self.scale))
@@ -1983,7 +2617,7 @@ class RealityCaptureMapCanvas(QFrame):
                 return sx, sy
 
             with self._map_lock:
-                pts_snap = list(self.rendered_points)
+                pts_arr = self.rendered_points
                 path_snap = list(self.trajectory_path)
                 peers_snap = list(self.peer_descriptors)
                 curr_dist = self.total_distance
@@ -1991,13 +2625,13 @@ class RealityCaptureMapCanvas(QFrame):
                 m12_on = self.m12_live_enabled
                 m12_prev = self.m12_preview_active
 
-            # 1. Vectorized Point Cloud Splatting (Luminous for AR Optical See-Through)
-            if pts_snap and w > 4 and h > 4:
-                pts_arr = np.asarray(pts_snap, dtype=np.float32)
+            # 1. Zero-Copy Vectorized Point Cloud Splatting (<0.6ms, rotates instantly with heading yaw!)
+            if len(pts_arr) > 0 and w > 4 and h > 4:
                 dx = pts_arr[:, 0] - self.current_x
                 dy = pts_arr[:, 1] - self.current_y
-                cos_y = math.cos(-self.current_yaw - math.pi / 2.0)
-                sin_y = math.sin(-self.current_yaw - math.pi / 2.0)
+                rot_ang = (math.pi / 2.0) - self.current_yaw
+                cos_y = math.cos(rot_ang)
+                sin_y = math.sin(rot_ang)
                 rx = dx * cos_y - dy * sin_y
                 ry = dx * sin_y + dy * cos_y
                 sx = np.rint(cx + rx * self.scale).astype(np.int32)
@@ -2071,6 +2705,42 @@ class RealityCaptureMapCanvas(QFrame):
                     tag = f"SNAPPED {peer.get('overlap_ratio', 0.0)*100:.0f}%" if is_snapped else "IMU+OFFSET"
                     painter.drawText(px_s + 10, py_s + 4, f"{peer.get('scanner_name', 'Peer')} [{tag}]")
 
+            # 2C. FARO Flash Scan Waypoint Anchors (Pulsating Gold Waypoint Pins)
+            with self._map_lock:
+                anchors_snap = list(self.flash_anchors)
+
+            for anchor in anchors_snap:
+                ax, ay = anchor["x"], anchor["y"]
+                label = anchor.get("label", "w00")
+                asx, asy = world_to_screen(ax, ay)
+                if -25 <= asx < w + 25 and -25 <= asy < h + 25:
+                    # Outer translucent halo ring
+                    painter.setPen(QPen(QColor(229, 201, 131, 160), 1.5))
+                    painter.setBrush(QColor(186, 161, 100, 50))
+                    painter.drawEllipse(QPointF(asx, asy), 8.5, 8.5)
+
+                    # Center solid gold anchor pin
+                    painter.setPen(QPen(QColor("#FCFBF8"), 1.2))
+                    painter.setBrush(QBrush(QColor("#E5C983")))
+                    painter.drawEllipse(QPointF(asx, asy), 4.0, 4.0)
+
+                    # Dark glass label badge with gold border
+                    badge_w = 34
+                    badge_h = 16
+                    bx = asx + 8
+                    by = asy - 18
+                    painter.setPen(QPen(QColor(186, 161, 100, 180), 1))
+                    painter.setBrush(QBrush(QColor(26, 29, 36, 215)))
+                    painter.drawRoundedRect(QRectF(bx, by, badge_w, badge_h), 4.0, 4.0)
+
+                    painter.setPen(QColor("#FCFBF8"))
+                    painter.setFont(QFont("IBM Plex Mono", 7, QFont.Weight.Bold))
+                    painter.drawText(
+                        QRectF(bx, by, badge_w, badge_h),
+                        Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter,
+                        label,
+                    )
+
             # 3. Local Location & Heading Arrow (Champagne Gold #BAA164 with Crisp White Rim)
             painter.save()
             painter.translate(cx, cy)
@@ -2090,24 +2760,30 @@ class RealityCaptureMapCanvas(QFrame):
             painter.setPen(QColor(186, 161, 100, 90))
             painter.drawLine(1, 25, w - 2, 25)
 
-            # HUD Layer Indicator + M12 & C-SLAM Status Badges
-            mode_display_names = {
-                "airy_only": "AIRY LiDAR ONLY",
-                "stereo_only": "GEMINI STEREO ONLY",
-                "fused": "FUSED GEOMETRY",
-                "colorized_fused": "COLORIZED FUSED MAP",
-                "accepted_rejected": "GEMINI ACCEPT / REJECT",
-                "observation_diag": "COVERAGE DIAGNOSTIC",
+            # HUD Layer Indicator + Color Legend + Live Point Count
+            mode_display_info = {
+                "airy_only": ("AIRY 360° LiDAR ONLY [GOLD]", "#E5C983"),
+                "stereo_only": ("GEMINI 336L CAMERA DEPTH ONLY [CYAN]", "#22D3EE"),
+                "fused": ("FUSED SENSOR LAYERS [GOLD=LiDAR · CYAN=CAMERA]", "#E5C983"),
+                "colorized_fused": ("COLORIZED FUSED [TRUE RGB + 360° SLATE]", "#FCFBF8"),
+                "accepted_rejected": ("GEMINI GATE [GREEN=ACCEPT · RED=REJECT]", "#4ADE80"),
+                "observation_diag": ("COVERAGE DIAG [GOLD=RGB · BLUE=DEPTH · GREEN=BOTH]", "#E5C983"),
             }
-            painter.setPen(QColor("#E5C983"))
+            lbl_text, lbl_hex = mode_display_info.get(mode_label, (mode_label.upper(), "#E5C983"))
+            painter.setPen(QColor(lbl_hex))
             painter.setFont(QFont("IBM Plex Mono", 8, QFont.Weight.Bold))
-            m12_badge = "  ·  M12 PREVIEW" if m12_prev else ("  ·  M12 RT ON" if m12_on else "  ·  M12 RT OFF")
-            cslam_badge = f"  ·  C-SLAM: {1 + len(peers_snap)} Scanners" if len(peers_snap) > 0 else ""
+            m12_badge = " · M12 PREVIEW" if m12_prev else (" · M12 RT ON" if m12_on else "")
+            cslam_badge = f" · C-SLAM({1 + len(peers_snap)})" if len(peers_snap) > 0 else ""
             painter.drawText(
                 10,
                 16,
-                f"LAYER: {mode_display_names.get(mode_label, mode_label.upper())}{m12_badge}{cslam_badge}",
+                f"VIEW: {lbl_text}  ({len(pts_arr):,} pts){m12_badge}{cslam_badge}",
             )
+
+            if len(pts_arr) == 0:
+                painter.setPen(QColor(229, 201, 131, 210))
+                painter.setFont(QFont("IBM Plex Mono", 8, QFont.Weight.DemiBold))
+                painter.drawText(12, 42, f"● Active View: {lbl_text} — Awaiting sensor points in this layer...")
 
             # Bottom Translucent Glass Telemetry Bar
             painter.fillRect(1, h - 30, w - 2, 29, QColor(255, 255, 255, 14))
@@ -2145,11 +2821,18 @@ class ScanHUBOS(QWidget):
         self.mapping_process = None
         self.sensor_stack_proc = None
         self.slam_stack_proc = None
+        self._external_stack_online = ("--stack-managed" in sys.argv)
         self.export_in_progress = False
         self._active_splash = None
         self._drag_offset = None
         # Default glass opacity is ultra-transparent 12% for maximum visibility when walking in AR glasses
         self.glass_opacity_pct = 12
+        self.projects_root = "/home/scanar/scanarMini/projects"
+        self.legacy_data_root = "/home/scanar/scanarMini/data"
+        os.makedirs(os.path.join(self.projects_root, "Default_Project", "datasets"), exist_ok=True)
+        self.active_project_name = "Default_Project"
+        self.active_dataset_name = f"Dataset_{datetime.now().strftime('%m%d_%H%M')}"
+
         self.diag_recorder = DiagnosticRecorder(base_dir="/home/scanar/scanarMini/diagnostics") if DiagnosticRecorder else None
         self.ros_worker = Ros2BridgeWorker(diag_recorder=self.diag_recorder)
 
@@ -2158,8 +2841,26 @@ class ScanHUBOS(QWidget):
         self.scan_clock_timer = QTimer()
         self.scan_clock_timer.timeout.connect(self.update_scan_clock_tick)
 
+        # Live Hub Refresh Timer (updates discovered active C-SLAM captures on LAN at 1 Hz)
+        self.hub_refresh_timer = QTimer()
+        self.hub_refresh_timer.timeout.connect(self.refresh_active_cslam_captures_ui)
+
+        # NavVis 2-Stage Ritual & FARO Flash Scan Waypoint State
+        self.anchor_count = 0
+        self.is_calibrated = False
+        self.calib_ticks = 0
+        self.calib_timer = None
+        self.calib_ax_sum = 0.0
+        self.calib_ay_sum = 0.0
+        self.calib_az_sum = 0.0
+
+        self.ros_worker.rotation_progress_received.connect(self.update_rotation_ritual_ui)
+        self.ros_worker.rotation_completed_received.connect(self.on_rotation_ritual_completed)
+
         self.export_finished.connect(self.on_export_finished)
         self.init_ui()
+        self.refresh_projects_hub_lists()
+        self.hub_refresh_timer.start(1000)
 
     def show_brand_splash(self, duration_ms: int = 2400):
         """Displays the Artificial Vision Translucent White & Gold Splash Screen on demand or startup."""
@@ -2490,6 +3191,20 @@ class ScanHUBOS(QWidget):
         main_layout.addWidget(self.header_bar)
 
         # ─────────────────────────────────────────────────────────────────────
+        # WORKSPACE STACK:
+        #   Page 0: Projects, Datasets & Live C-SLAM Active Captures Hub (Post-Splash Home)
+        #   Page 1: Capture Studio (Shown only after entering a Project & creating/joining a Dataset)
+        # ─────────────────────────────────────────────────────────────────────
+        self.workspace_stack = QStackedWidget()
+        self.projects_hub_page = self._build_projects_hub_page()
+        self.workspace_stack.addWidget(self.projects_hub_page)
+
+        self.capture_studio_page = QWidget()
+        capture_page_layout = QVBoxLayout(self.capture_studio_page)
+        capture_page_layout.setContentsMargins(0, 0, 0, 0)
+        capture_page_layout.setSpacing(0)
+
+        # ─────────────────────────────────────────────────────────────────────
         # 2. CONTROL BAR (Apple Glass Translucent White & Champagne Gold Action Bar)
         # ─────────────────────────────────────────────────────────────────────
         ctrl_bar = QFrame()
@@ -2500,7 +3215,17 @@ class ScanHUBOS(QWidget):
         )
         ctrl_layout = QHBoxLayout(ctrl_bar)
         ctrl_layout.setContentsMargins(14, 0, 14, 0)
-        ctrl_layout.setSpacing(10)
+        ctrl_layout.setSpacing(8)
+
+        self.btn_back_to_projects = QPushButton("← PROJECTS")
+        self.btn_back_to_projects.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_back_to_projects.setToolTip("Return to Projects, Datasets & Active C-SLAM Captures Menu")
+        self.btn_back_to_projects.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(255, 255, 255, 0.25); "
+            "color: #FCFBF8; padding: 6px 12px; border-radius: 9px; font-weight: 600; font-size: 10px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.22); border-color: #BAA164; color: #E5C983; }"
+        )
+        self.btn_back_to_projects.clicked.connect(self.show_projects_hub_view)
 
         self.stack_btn = QPushButton("🚀 START STACK")
         self.stack_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2510,6 +3235,8 @@ class ScanHUBOS(QWidget):
             "QPushButton:hover { background: rgba(186, 161, 100, 0.24); border-color: #FCFBF8; color: #FFFFFF; }"
         )
         self.stack_btn.clicked.connect(self.toggle_ros_stack)
+        if self._external_stack_online:
+            self._set_stack_buttons_online(True)
 
         self.start_btn = QPushButton("▶ START SCAN")
         self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2532,6 +3259,18 @@ class ScanHUBOS(QWidget):
         )
         self.stop_btn.clicked.connect(self.stop_scan_session)
 
+        self.flash_btn = QPushButton("⚡ FLASH")
+        self.flash_btn.setEnabled(False)
+        self.flash_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.flash_btn.setToolTip("Record FARO Flash Scan waypoint anchor at current location [Shortcut: F]")
+        self.flash_btn.setStyleSheet(
+            "QPushButton { background: rgba(229, 201, 131, 0.20); border: 1px solid #E5C983; "
+            "color: #FCFBF8; padding: 6px 14px; border-radius: 9px; font-weight: 700; font-size: 11px; }"
+            "QPushButton:hover:enabled { background: rgba(229, 201, 131, 0.38); border-color: #FCFBF8; color: #FFFFFF; }"
+            "QPushButton:disabled { background: rgba(255, 255, 255, 0.03); border-color: rgba(255, 255, 255, 0.10); color: rgba(252, 251, 248, 0.30); }"
+        )
+        self.flash_btn.clicked.connect(self.trigger_faro_flash_anchor)
+
         self.save_btn = QPushButton("↓ SAVE DATASET")
         self.save_btn.setEnabled(False)
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2543,13 +3282,14 @@ class ScanHUBOS(QWidget):
         )
         self.save_btn.clicked.connect(self.save_dataset)
 
-        self.btn_quick_m12_rt = QPushButton("✦ M12 RT: ON")
+        self.btn_quick_m12_rt = QPushButton("✦ M12 RT: OFF")
         self.btn_quick_m12_rt.setCheckable(True)
-        self.btn_quick_m12_rt.setChecked(True)
+        self.btn_quick_m12_rt.setChecked(False)
         self.btn_quick_m12_rt.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_quick_m12_rt.setToolTip("Toggle Real-Time M12 Cleanup (Default OFF for 60 FPS low-latency tracking; use Post-Process Preview/Commit/Export)")
         self.btn_quick_m12_rt.setStyleSheet(
-            "background: rgba(186, 161, 100, 0.18); border: 1px solid #BAA164; "
-            "color: #E5C983; padding: 6px 12px; border-radius: 9px; font-weight: 600; font-size: 10px;"
+            "background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(186, 161, 100, 0.45); "
+            "color: rgba(252, 251, 248, 0.78); padding: 6px 12px; border-radius: 9px; font-weight: 600; font-size: 10px;"
         )
         self.btn_quick_m12_rt.clicked.connect(self.on_quick_m12_rt_clicked)
 
@@ -2560,29 +3300,35 @@ class ScanHUBOS(QWidget):
             "border: 1px solid rgba(255, 255, 255, 0.22); padding: 4px 12px; border-radius: 9px;"
         )
 
-        dataset_lbl = QLabel("SESSION")
+        self.lbl_active_project_badge = QLabel(f"PROJECT: {self.active_project_name} /")
+        self.lbl_active_project_badge.setFont(QFont("IBM Plex Mono", 8, QFont.Weight.Bold))
+        self.lbl_active_project_badge.setStyleSheet("color: #E5C983; letter-spacing: 0.8px; border: none;")
+
+        dataset_lbl = QLabel("DATASET")
         dataset_lbl.setFont(QFont("IBM Plex Mono", 8, QFont.Weight.Bold))
-        dataset_lbl.setStyleSheet("color: #D8BF7C; letter-spacing: 1.2px; border: none;")
+        dataset_lbl.setStyleSheet("color: #D8BF7C; letter-spacing: 1.0px; border: none;")
         self.dataset_input = QLineEdit()
-        default_proj = f"Scan_{datetime.now().strftime('%m%d_%H%M')}"
-        self.dataset_input.setText(default_proj)
+        self.dataset_input.setText(self.active_dataset_name)
         self.dataset_input.setStyleSheet(
             "background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(186, 161, 100, 0.48); "
-            "color: #FCFBF8; padding: 5px 10px; border-radius: 9px; width: 145px; font-weight: 600;"
+            "color: #FCFBF8; padding: 5px 10px; border-radius: 9px; width: 135px; font-weight: 600;"
         )
-        self.ros_worker.cslam_engine.set_project_name(default_proj)
+        self.ros_worker.cslam_engine.set_project_name(self.active_project_name, self.active_dataset_name)
         self.dataset_input.textChanged.connect(self.on_project_name_changed)
 
+        ctrl_layout.addWidget(self.btn_back_to_projects)
         ctrl_layout.addWidget(self.stack_btn)
         ctrl_layout.addWidget(self.start_btn)
         ctrl_layout.addWidget(self.stop_btn)
+        ctrl_layout.addWidget(self.flash_btn)
         ctrl_layout.addWidget(self.save_btn)
         ctrl_layout.addWidget(self.btn_quick_m12_rt)
         ctrl_layout.addWidget(self.clock_lbl)
         ctrl_layout.addStretch()
+        ctrl_layout.addWidget(self.lbl_active_project_badge)
         ctrl_layout.addWidget(dataset_lbl)
         ctrl_layout.addWidget(self.dataset_input)
-        main_layout.addWidget(ctrl_bar)
+        capture_page_layout.addWidget(ctrl_bar)
 
         # ─────────────────────────────────────────────────────────────────────
         # 3. SPLIT WORKSPACE (Left: 100% Transparent AR Walking Viewport | Right: Glass HUD)
@@ -2603,6 +3349,18 @@ class ScanHUBOS(QWidget):
         self.progress_label.setStyleSheet("color: #E5C983; background: transparent;")
         prog_row.addWidget(self.progress_label)
         prog_row.addStretch()
+
+        self.btn_skip_ritual = QPushButton("Skip Ritual ⏭")
+        self.btn_skip_ritual.setVisible(False)
+        self.btn_skip_ritual.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_skip_ritual.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(186, 161, 100, 0.45); "
+            "color: #E5C983; padding: 2px 10px; border-radius: 6px; font-size: 10px; font-weight: 600; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.28); color: #FFFFFF; }"
+        )
+        self.btn_skip_ritual.clicked.connect(self.skip_rotation_ritual)
+        prog_row.addWidget(self.btn_skip_ritual)
+
         left_layout.addLayout(prog_row)
 
         self.bar = QProgressBar()
@@ -2741,7 +3499,7 @@ class ScanHUBOS(QWidget):
 
         rt_row = QHBoxLayout()
         self.chk_m12_realtime = QCheckBox("✦ Real-Time M12 Spatial Cleanup")
-        self.chk_m12_realtime.setChecked(True)
+        self.chk_m12_realtime.setChecked(False)
         self.chk_m12_realtime.setStyleSheet("color: #E5C983; font-size: 9px; font-weight: bold;")
         self.chk_m12_realtime.toggled.connect(self.on_m12_realtime_toggled)
 
@@ -2875,7 +3633,7 @@ class ScanHUBOS(QWidget):
         act_row.addWidget(self.btn_m12_export)
         m12_layout.addLayout(act_row)
 
-        self.lbl_m12_status = QLabel("M12 RT Filter: ON | Ready for live or interactive cleanup")
+        self.lbl_m12_status = QLabel("M12 RT Filter: OFF (Post-Process Ready — Preview / Commit / Export)")
         self.lbl_m12_status.setStyleSheet("color: #E5C983; font-size: 9px; font-family: 'IBM Plex Mono', Monospace; font-weight: 600;")
         m12_layout.addWidget(self.lbl_m12_status)
 
@@ -3075,13 +3833,18 @@ class ScanHUBOS(QWidget):
         )
         self.console.append("[Artificial Vision · scanHUB] Apple Glass White & Gold AR Spatial OS Initialized.")
         self.console.append("[AR PASSTHROUGH] Frameless translucent window + transparent Min/Max/Close controls active.")
-        self.console.append("[M12 CLEANUP] Real-time spatial-hash voxel/outlier filter ACTIVE.")
+        self.console.append("[M12 CLEANUP] Post-processing mode default (Real-time filter OFF for zero-lag 10Hz/20Hz streaming).")
         self.console.append("[C-SLAM] Unlimited Multi-Scanner Engine ONLINE (UDP Port 19440 | Non-Overlap IMU+Offset -> Auto Overlap Snap).")
         right_layout.addWidget(self.console, 1)
 
         splitter.addWidget(right_container)
         splitter.setSizes([790, 550])
-        main_layout.addWidget(splitter, 1)
+        capture_page_layout.addWidget(splitter, 1)
+
+        self.workspace_stack.addWidget(self.capture_studio_page)
+        # Open directly to Page 0 (Projects, Datasets & Active C-SLAM Captures Hub) after Splash Screen
+        self.workspace_stack.setCurrentIndex(0)
+        main_layout.addWidget(self.workspace_stack, 1)
 
         # ─────────────────────────────────────────────────────────────────────
         # 5. STATUS BAR (Translucent Apple Glass Footer + Transparent Corner SizeGrip)
@@ -3098,7 +3861,7 @@ class ScanHUBOS(QWidget):
         self.size_grip.setStyleSheet("background: transparent; width: 14px; height: 14px;")
         self.status_bar.addPermanentWidget(self.size_grip)
         self.status_bar.showMessage(
-            "VERIFY · DIRECT · CLARIFY  |  scanHUB Apple Glass AR Passthrough Active  |  M12 RT ON  |  C-SLAM ∞ Ready"
+            "VERIFY · DIRECT · CLARIFY  |  Select or Create a Project & Dataset, or Join an Active C-SLAM Capture to enter Capture Studio"
         )
         main_layout.addWidget(self.status_bar)
 
@@ -3111,11 +3874,590 @@ class ScanHUBOS(QWidget):
         self.ros_worker.telemetry_updated.connect(self.update_telemetry_ui)
         self.ros_worker.start()
 
+    def _build_projects_hub_page(self) -> QWidget:
+        """
+        Builds the Post-Splash Projects, Datasets & Live C-SLAM Active Captures Hub (Page 0).
+        Maintains the Apple Glass (visionOS) + Artificial Vision White & Champagne Gold (#FCFBF8, #BAA164, #E5C983)
+        ultra-transparent aesthetic.
+        """
+        hub_page = QWidget()
+        hub_page.setStyleSheet("background: transparent;")
+        root_layout = QVBoxLayout(hub_page)
+        root_layout.setContentsMargins(18, 12, 18, 14)
+        root_layout.setSpacing(12)
+
+        # Top Hub Action Banner
+        banner = QFrame()
+        banner.setFixedHeight(56)
+        banner.setStyleSheet(
+            "QFrame { background: rgba(255, 255, 255, 0.04); "
+            "border: 1px solid rgba(186, 161, 100, 0.42); border-radius: 12px; }"
+        )
+        b_layout = QHBoxLayout(banner)
+        b_layout.setContentsMargins(16, 6, 16, 6)
+        b_layout.setSpacing(12)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(1)
+        lbl_hub_title = QLabel("PROJECTS & COLLABORATIVE C-SLAM HUB")
+        lbl_hub_title.setFont(QFont("IBM Plex Sans", 11, QFont.Weight.Bold))
+        lbl_hub_title.setStyleSheet("color: #FCFBF8; letter-spacing: 0.8px; border: none; background: transparent;")
+        lbl_hub_sub = QLabel(
+            "Select or create a Project  ·  Create or open a Dataset  ·  Or join an Active Capture on the network via C-SLAM"
+        )
+        lbl_hub_sub.setFont(QFont("IBM Plex Sans", 8))
+        lbl_hub_sub.setStyleSheet("color: #E5C983; border: none; background: transparent;")
+        title_col.addWidget(lbl_hub_title)
+        title_col.addWidget(lbl_hub_sub)
+        b_layout.addLayout(title_col)
+        b_layout.addStretch()
+
+        self.hub_stack_btn = QPushButton("🚀 START STACK")
+        self.hub_stack_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hub_stack_btn.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(186, 161, 100, 0.60); "
+            "color: #E5C983; padding: 7px 15px; border-radius: 9px; font-weight: 600; font-size: 10px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.24); border-color: #FCFBF8; color: #FFFFFF; }"
+        )
+        self.hub_stack_btn.clicked.connect(self.toggle_ros_stack)
+
+        self.btn_hub_quick_resume = QPushButton("▶ RESUME CAPTURE STUDIO  →")
+        self.btn_hub_quick_resume.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_hub_quick_resume.setStyleSheet(
+            "QPushButton { background: rgba(186, 161, 100, 0.28); border: 1px solid #E5C983; "
+            "color: #FCFBF8; padding: 7px 16px; border-radius: 9px; font-weight: 600; font-size: 10px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.48); border-color: #FFFFFF; }"
+        )
+        self.btn_hub_quick_resume.clicked.connect(self.on_enter_capture_studio_clicked)
+
+        b_layout.addWidget(self.hub_stack_btn)
+        b_layout.addWidget(self.btn_hub_quick_resume)
+        root_layout.addWidget(banner)
+
+        # 3-Column Glass Cards Row
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(14)
+
+        card_style = (
+            "QFrame { background: rgba(255, 255, 255, 0.04); "
+            "border: 1px solid rgba(186, 161, 100, 0.38); border-radius: 12px; }"
+        )
+        list_style = (
+            "QListWidget { background: rgba(12, 12, 16, 0.48); "
+            "border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 8px; "
+            "color: #FCFBF8; padding: 6px; font-size: 10px; outline: none; }"
+            "QListWidget::item { padding: 8px 10px; border-radius: 6px; margin-bottom: 3px; "
+            "border: 1px solid rgba(255, 255, 255, 0.06); }"
+            "QListWidget::item:selected { background: rgba(186, 161, 100, 0.28); "
+            "border: 1px solid #E5C983; color: #FFFFFF; font-weight: bold; }"
+            "QListWidget::item:hover { background: rgba(255, 255, 255, 0.10); }"
+        )
+        input_style = (
+            "QLineEdit { background: rgba(255, 255, 255, 0.07); "
+            "border: 1px solid rgba(186, 161, 100, 0.48); color: #FCFBF8; "
+            "padding: 7px 10px; border-radius: 8px; font-size: 10px; font-weight: 600; }"
+        )
+
+        # ── COLUMN 1: PROJECTS ──
+        col1 = QFrame()
+        col1.setStyleSheet(card_style)
+        c1_layout = QVBoxLayout(col1)
+        c1_layout.setContentsMargins(14, 12, 14, 12)
+        c1_layout.setSpacing(8)
+
+        lbl_c1 = QLabel("1 · SELECT OR CREATE PROJECT")
+        lbl_c1.setFont(QFont("IBM Plex Mono", 9, QFont.Weight.Bold))
+        lbl_c1.setStyleSheet("color: #E5C983; letter-spacing: 1.0px; border: none; background: transparent;")
+        lbl_c1_desc = QLabel("Organize scans by building, site, or job:")
+        lbl_c1_desc.setStyleSheet("color: rgba(252, 251, 248, 0.72); font-size: 9px; border: none; background: transparent;")
+        c1_layout.addWidget(lbl_c1)
+        c1_layout.addWidget(lbl_c1_desc)
+
+        self.hub_projects_list = QListWidget()
+        self.hub_projects_list.setStyleSheet(list_style)
+        self.hub_projects_list.itemSelectionChanged.connect(self.on_hub_project_selected)
+        c1_layout.addWidget(self.hub_projects_list, 1)
+
+        new_proj_row = QHBoxLayout()
+        new_proj_row.setSpacing(6)
+        self.hub_new_project_input = QLineEdit()
+        self.hub_new_project_input.setPlaceholderText("New Project Name (e.g. Site_Tower_A)")
+        self.hub_new_project_input.setStyleSheet(input_style)
+        self.hub_new_project_input.returnPressed.connect(self.on_create_project_clicked)
+
+        self.btn_create_project = QPushButton("+ New Project")
+        self.btn_create_project.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_create_project.setStyleSheet(
+            "QPushButton { background: rgba(186, 161, 100, 0.24); border: 1px solid #BAA164; "
+            "color: #E5C983; padding: 7px 12px; border-radius: 8px; font-weight: 600; font-size: 9px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.42); color: #FFFFFF; }"
+        )
+        self.btn_create_project.clicked.connect(self.on_create_project_clicked)
+        new_proj_row.addWidget(self.hub_new_project_input, 1)
+        new_proj_row.addWidget(self.btn_create_project)
+        c1_layout.addLayout(new_proj_row)
+
+        cards_row.addWidget(col1, 1)
+
+        # ── COLUMN 2: DATASETS WITHIN SELECTED PROJECT ──
+        col2 = QFrame()
+        col2.setStyleSheet(card_style)
+        c2_layout = QVBoxLayout(col2)
+        c2_layout.setContentsMargins(14, 12, 14, 12)
+        c2_layout.setSpacing(8)
+
+        lbl_c2 = QLabel("2 · PROJECT DATASETS")
+        lbl_c2.setFont(QFont("IBM Plex Mono", 9, QFont.Weight.Bold))
+        lbl_c2.setStyleSheet("color: #E5C983; letter-spacing: 1.0px; border: none; background: transparent;")
+        self.lbl_hub_selected_project = QLabel(f"Active Project: {self.active_project_name}")
+        self.lbl_hub_selected_project.setStyleSheet("color: #FCFBF8; font-size: 9px; font-weight: 600; border: none; background: transparent;")
+        c2_layout.addWidget(lbl_c2)
+        c2_layout.addWidget(self.lbl_hub_selected_project)
+
+        self.hub_datasets_list = QListWidget()
+        self.hub_datasets_list.setStyleSheet(list_style)
+        self.hub_datasets_list.itemSelectionChanged.connect(self.on_hub_dataset_selected)
+        self.hub_datasets_list.itemDoubleClicked.connect(lambda _: self.on_enter_capture_studio_clicked())
+        c2_layout.addWidget(self.hub_datasets_list, 1)
+
+        self.lbl_hub_dataset_meta = QLabel("Select an existing dataset above or create a new dataset below.")
+        self.lbl_hub_dataset_meta.setStyleSheet(
+            "color: rgba(252, 251, 248, 0.78); font-size: 9px; font-family: 'IBM Plex Mono', Monospace; "
+            "background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.14); "
+            "border-radius: 6px; padding: 5px 8px;"
+        )
+        c2_layout.addWidget(self.lbl_hub_dataset_meta)
+
+        new_ds_row = QHBoxLayout()
+        new_ds_row.setSpacing(6)
+        self.hub_new_dataset_input = QLineEdit()
+        self.hub_new_dataset_input.setText(self.active_dataset_name)
+        self.hub_new_dataset_input.setPlaceholderText("Dataset Name (e.g. Floor1_North)")
+        self.hub_new_dataset_input.setStyleSheet(input_style)
+        self.hub_new_dataset_input.returnPressed.connect(self.on_create_dataset_clicked)
+
+        self.btn_create_dataset = QPushButton("+ New Dataset")
+        self.btn_create_dataset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_create_dataset.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.10); border: 1px solid #BAA164; "
+            "color: #E5C983; padding: 7px 12px; border-radius: 8px; font-weight: 600; font-size: 9px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.30); color: #FFFFFF; }"
+        )
+        self.btn_create_dataset.clicked.connect(self.on_create_dataset_clicked)
+        new_ds_row.addWidget(self.hub_new_dataset_input, 1)
+        new_ds_row.addWidget(self.btn_create_dataset)
+        c2_layout.addLayout(new_ds_row)
+
+        self.btn_enter_capture_studio = QPushButton("▶ OPEN CAPTURE STUDIO FOR THIS DATASET  →")
+        self.btn_enter_capture_studio.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_enter_capture_studio.setStyleSheet(
+            "QPushButton { background: rgba(186, 161, 100, 0.36); border: 1px solid #E5C983; "
+            "color: #FCFBF8; padding: 10px 14px; border-radius: 9px; font-weight: bold; font-size: 10px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.56); border-color: #FFFFFF; color: #FFFFFF; }"
+        )
+        self.btn_enter_capture_studio.clicked.connect(self.on_enter_capture_studio_clicked)
+        c2_layout.addWidget(self.btn_enter_capture_studio)
+
+        cards_row.addWidget(col2, 1)
+
+        # ── COLUMN 3: LIVE ACTIVE CAPTURES ON NETWORK (C-SLAM JOIN) ──
+        col3 = QFrame()
+        col3.setStyleSheet(card_style)
+        c3_layout = QVBoxLayout(col3)
+        c3_layout.setContentsMargins(14, 12, 14, 12)
+        c3_layout.setSpacing(8)
+
+        lbl_c3 = QLabel("3 · ACTIVE C-SLAM CAPTURES ON NETWORK")
+        lbl_c3.setFont(QFont("IBM Plex Mono", 9, QFont.Weight.Bold))
+        lbl_c3.setStyleSheet("color: #4ADE80; letter-spacing: 1.0px; border: none; background: transparent;")
+        self.lbl_hub_cslam_status = QLabel("Listening on UDP 19440 (LAN Broadcast + Unicast) for active scanners...")
+        self.lbl_hub_cslam_status.setStyleSheet("color: rgba(252, 251, 248, 0.78); font-size: 9px; border: none; background: transparent;")
+        c3_layout.addWidget(lbl_c3)
+        c3_layout.addWidget(self.lbl_hub_cslam_status)
+
+        self.hub_active_captures_list = QListWidget()
+        self.hub_active_captures_list.setStyleSheet(list_style)
+        self.hub_active_captures_list.itemDoubleClicked.connect(lambda _: self.on_join_active_capture_clicked())
+        c3_layout.addWidget(self.hub_active_captures_list, 1)
+
+        peer_ip_row = QHBoxLayout()
+        peer_ip_row.setSpacing(6)
+        self.hub_peer_ip_input = QLineEdit()
+        self.hub_peer_ip_input.setPlaceholderText("Remote Device IP (e.g. 192.168.1.50)")
+        self.hub_peer_ip_input.setStyleSheet(input_style)
+        self.hub_peer_ip_input.returnPressed.connect(self.on_hub_add_ip_clicked)
+
+        self.btn_hub_add_ip = QPushButton("+ Connect IP")
+        self.btn_hub_add_ip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_hub_add_ip.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.09); border: 1px solid #BAA164; "
+            "color: #E5C983; padding: 7px 10px; border-radius: 8px; font-weight: 600; font-size: 9px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.28); color: #FFFFFF; }"
+        )
+        self.btn_hub_add_ip.clicked.connect(self.on_hub_add_ip_clicked)
+
+        self.btn_hub_sim_capture = QPushButton("+ Sim Active Capture")
+        self.btn_hub_sim_capture.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_hub_sim_capture.setToolTip("Simulate a remote scanner broadcasting an active capture session on the network")
+        self.btn_hub_sim_capture.setStyleSheet(
+            "QPushButton { background: rgba(186, 161, 100, 0.18); border: 1px solid rgba(229, 201, 131, 0.55); "
+            "color: #E5C983; padding: 7px 10px; border-radius: 8px; font-weight: 600; font-size: 9px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.36); color: #FFFFFF; }"
+        )
+        self.btn_hub_sim_capture.clicked.connect(self.on_hub_sim_active_capture_clicked)
+
+        peer_ip_row.addWidget(self.hub_peer_ip_input, 1)
+        peer_ip_row.addWidget(self.btn_hub_add_ip)
+        peer_ip_row.addWidget(self.btn_hub_sim_capture)
+        c3_layout.addLayout(peer_ip_row)
+
+        self.btn_join_active_capture = QPushButton("🌐 JOIN SELECTED CAPTURE WITH C-SLAM  →")
+        self.btn_join_active_capture.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_join_active_capture.setStyleSheet(
+            "QPushButton { background: rgba(34, 197, 94, 0.24); border: 1px solid #4ADE80; "
+            "color: #FCFBF8; padding: 10px 14px; border-radius: 9px; font-weight: bold; font-size: 10px; }"
+            "QPushButton:hover { background: rgba(34, 197, 94, 0.42); border-color: #FFFFFF; color: #FFFFFF; }"
+        )
+        self.btn_join_active_capture.clicked.connect(self.on_join_active_capture_clicked)
+        c3_layout.addWidget(self.btn_join_active_capture)
+
+        cards_row.addWidget(col3, 1)
+        root_layout.addLayout(cards_row, 1)
+        return hub_page
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PROJECTS, DATASETS & LIVE C-SLAM HUB NAVIGATION METHODS
+    # ─────────────────────────────────────────────────────────────────────────
+    def show_projects_hub_view(self):
+        """Switches to Page 0 (Projects, Datasets & Active C-SLAM Captures Hub)."""
+        self.refresh_projects_hub_lists()
+        self.refresh_active_cslam_captures_ui()
+        self.workspace_stack.setCurrentIndex(0)
+        self.status_bar.showMessage(
+            f"PROJECTS HUB  |  Active Project: {self.active_project_name}  ·  Dataset: {self.active_dataset_name}"
+        )
+
+    def show_capture_studio_view(self, project_name: str = None, dataset_name: str = None, joined_cslam: bool = False):
+        """Enters Page 1 (Capture Studio) for the specified Project and Dataset."""
+        if project_name:
+            self.active_project_name = project_name.strip().replace(" ", "_") or "Default_Project"
+        if dataset_name:
+            self.active_dataset_name = dataset_name.strip().replace(" ", "_") or f"Dataset_{datetime.now().strftime('%m%d_%H%M')}"
+
+        if self.active_project_name != "Legacy_Scans":
+            proj_ds_dir = os.path.join(self.projects_root, self.active_project_name, "datasets", self.active_dataset_name)
+            os.makedirs(proj_ds_dir, exist_ok=True)
+
+        self.lbl_active_project_badge.setText(f"PROJECT: {self.active_project_name} /")
+        self.dataset_input.blockSignals(True)
+        self.dataset_input.setText(self.active_dataset_name)
+        self.dataset_input.blockSignals(False)
+
+        self.ros_worker.cslam_engine.set_project_name(self.active_project_name, self.active_dataset_name)
+        self.workspace_stack.setCurrentIndex(1)
+
+        if joined_cslam:
+            self.hud_tabs.setCurrentIndex(1)  # Focus C-SLAM Peers tab
+            self.console.append(
+                f"\n[C-SLAM JOIN] Joined Active Network Capture -> Project: {self.active_project_name} | Dataset: {self.active_dataset_name}"
+            )
+            self.status_bar.showMessage(
+                f"C-SLAM COLLABORATIVE SESSION  |  Project: {self.active_project_name}  ·  Dataset: {self.active_dataset_name}"
+            )
+        else:
+            self.console.append(
+                f"\n[PROJECT READY] Opened Project '{self.active_project_name}' · Dataset '{self.active_dataset_name}' in Capture Studio."
+            )
+            self.status_bar.showMessage(
+                f"CAPTURE STUDIO READY  |  Project: {self.active_project_name}  ·  Dataset: {self.active_dataset_name}"
+            )
+        self.ros_worker.dispatch_live_map_and_telemetry(force=True)
+
+    def refresh_projects_hub_lists(self):
+        """Scans /home/scanar/scanarMini/projects (plus Legacy_Scans in data/) and populates the Projects & Datasets lists."""
+        os.makedirs(self.projects_root, exist_ok=True)
+        os.makedirs(os.path.join(self.projects_root, "Default_Project", "datasets"), exist_ok=True)
+
+        projects = []
+        try:
+            for entry in sorted(os.listdir(self.projects_root)):
+                full_p = os.path.join(self.projects_root, entry)
+                if os.path.isdir(full_p) and not entry.startswith("."):
+                    projects.append(entry)
+        except Exception:
+            pass
+
+        if "Default_Project" not in projects:
+            projects.insert(0, "Default_Project")
+
+        # Also surface existing scans in /home/scanar/scanarMini/data as Legacy_Scans
+        if os.path.isdir(self.legacy_data_root):
+            try:
+                legacy_items = [
+                    d for d in os.listdir(self.legacy_data_root)
+                    if os.path.isdir(os.path.join(self.legacy_data_root, d)) and not d.startswith(".")
+                ]
+                if legacy_items and "Legacy_Scans" not in projects:
+                    projects.append("Legacy_Scans")
+            except Exception:
+                pass
+
+        self.hub_projects_list.blockSignals(True)
+        self.hub_projects_list.clear()
+        selected_idx = 0
+        for idx, proj in enumerate(projects):
+            ds_count = len(self._list_datasets_for_project(proj))
+            item = QListWidgetItem(f"📁  {proj}   ({ds_count} dataset{'s' if ds_count != 1 else ''})")
+            item.setData(Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole, proj)
+            self.hub_projects_list.addItem(item)
+            if proj == self.active_project_name:
+                selected_idx = idx
+
+        if self.hub_projects_list.count() > 0:
+            self.hub_projects_list.setCurrentRow(selected_idx)
+        self.hub_projects_list.blockSignals(False)
+        self._populate_datasets_for_project(self.active_project_name)
+
+    def _list_datasets_for_project(self, project_name: str):
+        if project_name == "Legacy_Scans":
+            base_dir = self.legacy_data_root
+        else:
+            base_dir = os.path.join(self.projects_root, project_name, "datasets")
+        if not os.path.isdir(base_dir):
+            return []
+        out = []
+        try:
+            for d in sorted(os.listdir(base_dir), reverse=True):
+                full_d = os.path.join(base_dir, d)
+                if os.path.isdir(full_d) and not d.startswith("."):
+                    out.append((d, full_d))
+        except Exception:
+            pass
+        return out
+
+    def _populate_datasets_for_project(self, project_name: str):
+        self.lbl_hub_selected_project.setText(f"Active Project: {project_name}")
+        datasets = self._list_datasets_for_project(project_name)
+
+        self.hub_datasets_list.blockSignals(True)
+        self.hub_datasets_list.clear()
+        role = Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole
+
+        selected_row = -1
+        for idx, (ds_name, ds_path) in enumerate(datasets):
+            meta_path = os.path.join(ds_path, "scan_metadata.json")
+            badge = "Ready to Scan"
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r") as f:
+                        meta = json.load(f)
+                    fused_n = meta.get("fused_points", meta.get("airy_points", 0))
+                    badge = f"✓ Saved ({fused_n:,} pts)"
+                except Exception:
+                    badge = "✓ Saved"
+            item = QListWidgetItem(f"🗂  {ds_name}   ·   {badge}")
+            item.setData(role, ds_name)
+            self.hub_datasets_list.addItem(item)
+            if ds_name == self.active_dataset_name:
+                selected_row = idx
+
+        if selected_row >= 0:
+            self.hub_datasets_list.setCurrentRow(selected_row)
+        self.hub_datasets_list.blockSignals(False)
+
+    def on_hub_project_selected(self):
+        items = self.hub_projects_list.selectedItems()
+        if not items:
+            return
+        role = Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole
+        proj = items[0].data(role)
+        if proj:
+            self.active_project_name = proj
+            self._populate_datasets_for_project(proj)
+
+    def on_hub_dataset_selected(self):
+        items = self.hub_datasets_list.selectedItems()
+        if not items:
+            return
+        role = Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole
+        ds_name = items[0].data(role)
+        if not ds_name:
+            return
+        self.active_dataset_name = ds_name
+        self.hub_new_dataset_input.setText(ds_name)
+
+        if self.active_project_name == "Legacy_Scans":
+            ds_path = os.path.join(self.legacy_data_root, ds_name)
+        else:
+            ds_path = os.path.join(self.projects_root, self.active_project_name, "datasets", ds_name)
+        meta_path = os.path.join(ds_path, "scan_metadata.json")
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path, "r") as f:
+                    meta = json.load(f)
+                a_pts = meta.get("airy_points", 0)
+                s_pts = meta.get("stereo_points", 0)
+                f_pts = meta.get("fused_points", 0)
+                ts = meta.get("timestamp", "")[:19]
+                self.lbl_hub_dataset_meta.setText(
+                    f"Dataset '{ds_name}' ({ts}) — Fused: {f_pts:,} | Airy: {a_pts:,} | Gemini: {s_pts:,} pts"
+                )
+                return
+            except Exception:
+                pass
+        self.lbl_hub_dataset_meta.setText(
+            f"Dataset '{ds_name}' in Project '{self.active_project_name}' — Ready to open in Capture Studio."
+        )
+
+    def on_create_project_clicked(self):
+        raw_name = self.hub_new_project_input.text().strip().replace(" ", "_")
+        if not raw_name:
+            raw_name = f"Project_{datetime.now().strftime('%m%d_%H%M')}"
+        proj_dir = os.path.join(self.projects_root, raw_name, "datasets")
+        os.makedirs(proj_dir, exist_ok=True)
+        self.active_project_name = raw_name
+        self.hub_new_project_input.clear()
+        new_ds = f"Dataset_{datetime.now().strftime('%m%d_%H%M')}"
+        os.makedirs(os.path.join(proj_dir, new_ds), exist_ok=True)
+        self.active_dataset_name = new_ds
+        self.hub_new_dataset_input.setText(new_ds)
+        self.refresh_projects_hub_lists()
+        self.lbl_hub_dataset_meta.setText(f"Created Project '{raw_name}' with initial dataset '{new_ds}'.")
+
+    def on_create_dataset_clicked(self):
+        ds_name = self.hub_new_dataset_input.text().strip().replace(" ", "_")
+        if not ds_name:
+            ds_name = f"Dataset_{datetime.now().strftime('%m%d_%H%M')}"
+            self.hub_new_dataset_input.setText(ds_name)
+        if self.active_project_name == "Legacy_Scans":
+            self.active_project_name = "Default_Project"
+        ds_dir = os.path.join(self.projects_root, self.active_project_name, "datasets", ds_name)
+        os.makedirs(ds_dir, exist_ok=True)
+        self.active_dataset_name = ds_name
+        self.refresh_projects_hub_lists()
+        self.lbl_hub_dataset_meta.setText(
+            f"Created Dataset '{ds_name}' in Project '{self.active_project_name}'. Click 'OPEN CAPTURE STUDIO' to scan."
+        )
+
+    def on_enter_capture_studio_clicked(self):
+        ds_name = self.hub_new_dataset_input.text().strip().replace(" ", "_")
+        if not ds_name:
+            ds_name = self.active_dataset_name or f"Dataset_{datetime.now().strftime('%m%d_%H%M')}"
+        self.show_capture_studio_view(self.active_project_name, ds_name, joined_cslam=False)
+
+    def refresh_active_cslam_captures_ui(self):
+        """Refreshes Column 3 in the Projects Hub with all active C-SLAM captures discovered on the network."""
+        eng = self.ros_worker.cslam_engine
+        sessions = eng.get_discovered_network_sessions()
+        role = Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole
+
+        prev_selected_key = None
+        sel_items = self.hub_active_captures_list.selectedItems()
+        if sel_items:
+            prev_selected_key = sel_items[0].data(role)
+
+        self.hub_active_captures_list.blockSignals(True)
+        self.hub_active_captures_list.clear()
+
+        if not sessions:
+            port_num = getattr(eng, "_bound_port", 19210)
+            host_lbl = getattr(eng, "scanner_name", "ScanHUB-Host")
+            self.lbl_hub_cslam_status.setText(
+                f"Listening on UDP {port_num} · Local Host: {host_lbl} (No remote captures detected yet)"
+            )
+            placeholder = QListWidgetItem(
+                "📡  No remote active captures detected on LAN yet.\n"
+                "     • Start a scan on another device on the same network, OR\n"
+                "     • Enter a remote device IP below, OR click '+ Sim Active Capture' to test C-SLAM join."
+            )
+            placeholder.setData(role, None)
+            self.hub_active_captures_list.addItem(placeholder)
+        else:
+            rec_count = sum(1 for s in sessions if s.get("is_recording"))
+            self.lbl_hub_cslam_status.setText(
+                f"🟢 {len(sessions)} Active C-SLAM Session(s) on Network ({rec_count} Recording Live)"
+            )
+            restore_row = 0
+            now_t = time.time()
+            for idx, sess in enumerate(sessions):
+                proj = sess.get("project_name", "Default_Project")
+                ds = sess.get("dataset_name", "Active_Scan")
+                host_name = sess.get("scanner_name") or sess.get("host_scanner_name", "Remote_Scanner")
+                ip = sess.get("ip_address") or sess.get("host_ip", "LAN")
+                pts = sess.get("point_count", sess.get("total_points", 0))
+                sc_cnt = sess.get("scanner_count", 1)
+                is_rec = sess.get("is_recording", False)
+                age = sess.get("age_sec", max(0.0, now_t - sess.get("last_seen_ts", now_t)))
+                status_tag = "🟢 RECORDING LIVE" if is_rec else "● ONLINE STANDBY"
+                label = (
+                    f"{status_tag}  |  Project: {proj}  ·  Dataset: {ds}\n"
+                    f"     Host: {host_name} ({ip})  ·  {sc_cnt} Scanner(s)  ·  {pts:,} pts  ({age:.1f}s ago)"
+                )
+                item = QListWidgetItem(label)
+                key_tuple = (proj, ds, host_name)
+                item.setData(role, key_tuple)
+                self.hub_active_captures_list.addItem(item)
+                if prev_selected_key == key_tuple:
+                    restore_row = idx
+            if self.hub_active_captures_list.count() > 0:
+                self.hub_active_captures_list.setCurrentRow(restore_row)
+
+        self.hub_active_captures_list.blockSignals(False)
+
+    def on_hub_add_ip_clicked(self):
+        ip = self.hub_peer_ip_input.text().strip()
+        if not ip:
+            return
+        self.ros_worker.cslam_engine.add_unicast_peer(ip)
+        self.console.append(f"[C-SLAM HUB] Added Unicast Peer Scanner IP: {ip}:19440")
+        self.lbl_hub_cslam_status.setText(f"Added Unicast Peer {ip}:19440 — polling for active capture packets...")
+        self.hub_peer_ip_input.clear()
+
+    def on_hub_sim_active_capture_clicked(self):
+        """Spawns a simulated remote scanner broadcasting an active capture so C-SLAM Join can be tested anytime."""
+        self.ros_worker.ensure_local_cloud_for_interactive_ops()
+        sim_proj = self.active_project_name or "Default_Project"
+        sim_ds = self.hub_new_dataset_input.text().strip().replace(" ", "_") or self.active_dataset_name
+        self.ros_worker.cslam_engine.set_project_name(sim_proj, sim_ds)
+        sim_id = self.ros_worker.cslam_engine.spawn_simulated_peer_scanner()
+        self.refresh_active_cslam_captures_ui()
+        self.console.append(
+            f"[C-SLAM HUB] Simulated Remote Active Capture ({sim_id[-8:]}) on Project '{sim_proj}' / Dataset '{sim_ds}'."
+        )
+
+    def on_join_active_capture_clicked(self):
+        """Joins the selected active C-SLAM capture session and opens the Capture Studio."""
+        role = Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole
+        sel_items = self.hub_active_captures_list.selectedItems()
+        target_proj = None
+        target_ds = None
+
+        if sel_items:
+            data = sel_items[0].data(role)
+            if isinstance(data, tuple) and len(data) >= 2:
+                target_proj, target_ds = data[0], data[1]
+
+        if not target_proj:
+            sessions = self.ros_worker.cslam_engine.get_discovered_network_sessions()
+            if sessions:
+                target_proj = sessions[0].get("project_name", self.active_project_name)
+                target_ds = sessions[0].get("dataset_name", self.active_dataset_name)
+            else:
+                # If no remote session is broadcasting yet, spawn a simulated peer on the current project/dataset
+                # so the user can immediately experience collaborative C-SLAM in the Capture Studio
+                self.on_hub_sim_active_capture_clicked()
+                target_proj = self.active_project_name
+                target_ds = self.active_dataset_name
+
+        if self.map_canvas.view_radius_m < 22.0:
+            self.map_canvas.set_view_radius(25.0)
+        self.show_capture_studio_view(target_proj, target_ds, joined_cslam=True)
+
     def _style_layer_buttons(self, active_mode: str):
         for mode_key, btn in getattr(self, "_layer_buttons", {}).items():
             if mode_key == active_mode:
                 btn.setStyleSheet(
-                    "background: rgba(186, 161, 100, 0.24); border: 1px solid #BAA164; color: #FCFBF8; "
+                    "background: rgba(186, 161, 100, 0.28); border: 1px solid #E5C983; color: #FFFFFF; "
                     "padding: 3px 7px; font-size: 9px; font-weight: bold; border-radius: 6px;"
                 )
             else:
@@ -3134,8 +4476,9 @@ class ScanHUBOS(QWidget):
         return w
 
     def on_project_name_changed(self, text: str):
-        proj = text.strip().replace(" ", "_") or "Default_Project"
-        self.ros_worker.cslam_engine.set_project_name(proj)
+        ds = text.strip().replace(" ", "_") or "Default_Dataset"
+        self.active_dataset_name = ds
+        self.ros_worker.cslam_engine.set_project_name(self.active_project_name, ds)
 
     def build_m12_params_from_ui(self) -> CleanupParams:
         return CleanupParams(
@@ -3171,13 +4514,15 @@ class ScanHUBOS(QWidget):
         self.btn_quick_m12_rt.setChecked(checked)
         self.btn_quick_m12_rt.setText(f"✦ M12 RT: {'ON' if checked else 'OFF'}")
         self.btn_quick_m12_rt.setStyleSheet(
-            f"background: {'rgba(186, 161, 100, 0.18)' if checked else 'rgba(239, 68, 68, 0.16)'}; "
-            f"border: 1px solid {'#BAA164' if checked else '#F87171'}; "
-            f"color: {'#E5C983' if checked else '#FCA5A5'}; "
+            f"background: {'rgba(186, 161, 100, 0.18)' if checked else 'rgba(255, 255, 255, 0.07)'}; "
+            f"border: 1px solid {'#BAA164' if checked else 'rgba(186, 161, 100, 0.45)'}; "
+            f"color: {'#E5C983' if checked else 'rgba(252, 251, 248, 0.78)'}; "
             f"padding: 6px 12px; border-radius: 9px; font-weight: 600; font-size: 10px;"
         )
         self.btn_quick_m12_rt.blockSignals(False)
-        self.console.append(f"[M12 CLEANUP] Real-Time Spatial-Hash Point Cloud Cleanup: {'ENABLED' if checked else 'DISABLED'}")
+        if not checked:
+            self.lbl_m12_status.setText("M12 RT Filter: OFF (Post-Process Ready — Preview / Commit / Export)")
+        self.console.append(f"[M12 CLEANUP] Real-Time Spatial-Hash Point Cloud Cleanup: {'ENABLED' if checked else 'DISABLED (Post-Process Mode)'}")
 
     def on_m12_ground_lock_toggled(self, checked: bool):
         self.ros_worker.set_live_ground_lock_enabled(checked)
@@ -3211,6 +4556,11 @@ class ScanHUBOS(QWidget):
         self.lbl_m12_status.setText(f"M12 Committed: {committed:,} clean points locked into active map.")
         self.console.append(f"[M12 COMMIT] Committed {committed:,} cleaned points to active session map.")
 
+    def _get_active_dataset_save_dir(self, dataset_name: str) -> str:
+        if self.active_project_name == "Legacy_Scans":
+            return os.path.join(self.legacy_data_root, dataset_name)
+        return os.path.join(self.projects_root, self.active_project_name, "datasets", dataset_name)
+
     def on_m12_export_clicked(self):
         self._m12_status_hold_until = time.time() + 2.5
         fmt_str = self.combo_m12_fmt.currentText()
@@ -3224,7 +4574,8 @@ class ScanHUBOS(QWidget):
         }
         ext = ext_map.get(fmt_str, "ply")
         dataset = self.dataset_input.text().strip().replace(" ", "_") or "Scan"
-        out_dir = f"/home/scanar/scanarMini/data/{dataset}/m12_exports"
+        base_ds_dir = self._get_active_dataset_save_dir(dataset)
+        out_dir = os.path.join(base_ds_dir, "m12_exports")
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{dataset}_m12_{fmt_str.lower()}.{ext}")
         res = self.ros_worker.export_m12_cloud(fmt_str, out_path, mesh_res_m=float(self.spin_m12_voxel.value()) * 2.0)
@@ -3257,7 +4608,7 @@ class ScanHUBOS(QWidget):
                 "background: rgba(186, 161, 100, 0.18); color: #E5C983; border: 1px solid #BAA164; font-size: 9px; font-weight: 600; padding: 3px 8px; border-radius: 6px;"
             )
             self.console.append("[C-SLAM] Switched display to DISTINCT SCANNER COLORS (each scanner uniquely colored).")
-        self.ros_worker.dispatch_live_map_and_telemetry()
+        self.ros_worker.dispatch_live_map_and_telemetry(force=True)
 
     def on_add_peer_ip_clicked(self):
         ip = self.input_peer_ip.text().strip()
@@ -3269,7 +4620,7 @@ class ScanHUBOS(QWidget):
 
     def on_spawn_sim_peer_clicked(self):
         self.ros_worker.ensure_local_cloud_for_interactive_ops()
-        self.ros_worker.dispatch_live_map_and_telemetry()
+        self.ros_worker.dispatch_live_map_and_telemetry(force=True)
         sim_id = self.ros_worker.cslam_engine.spawn_simulated_peer_scanner()
         if self.map_canvas.view_radius_m < 22.0:
             self.map_canvas.set_view_radius(25.0)
@@ -3280,12 +4631,12 @@ class ScanHUBOS(QWidget):
 
     def on_force_snap_clicked(self):
         self.ros_worker.cslam_engine.run_overlap_check_now()
-        self.ros_worker.dispatch_live_map_and_telemetry()
+        self.ros_worker.dispatch_live_map_and_telemetry(force=True)
         self.console.append("[C-SLAM] Triggered immediate multi-peer 3D KD-Tree ICP overlap check.")
 
     def on_clear_peers_clicked(self):
         self.ros_worker.cslam_engine.clear_peers()
-        self.ros_worker.dispatch_live_map_and_telemetry()
+        self.ros_worker.dispatch_live_map_and_telemetry(force=True)
         self.console.append("[C-SLAM] Cleared remote/simulated peer scanners.")
 
     def on_sliders_changed(self):
@@ -3306,12 +4657,35 @@ class ScanHUBOS(QWidget):
 
     def on_layer_mode_clicked(self, mode_key):
         self._style_layer_buttons(mode_key)
+        self.map_canvas.set_active_mode_immediate(mode_key)
         self.ros_worker.set_display_mode(mode_key)
-        self.console.append(f"[VIEW] Switched Point Cloud Display Layer: {mode_key}")
+        self.ros_worker.dispatch_live_map_and_telemetry(force=True)
+        self.console.append(f"[VIEW] Switched Point Cloud Display Layer -> {mode_key}")
+
+    def _set_stack_buttons_online(self, online: bool):
+        if online:
+            txt = "⏹ STOP STACK (ONLINE)"
+            style = (
+                "QPushButton { background: rgba(239, 68, 68, 0.20); border: 1px solid #F87171; "
+                "color: #FCA5A5; padding: 6px 14px; border-radius: 9px; font-weight: 600; font-size: 10px; }"
+                "QPushButton:hover { background: rgba(239, 68, 68, 0.34); color: #FFFFFF; }"
+            )
+        else:
+            txt = "🚀 START STACK"
+            style = (
+                "QPushButton { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(186, 161, 100, 0.60); "
+                "color: #E5C983; padding: 6px 14px; border-radius: 9px; font-weight: 600; font-size: 10px; }"
+                "QPushButton:hover { background: rgba(186, 161, 100, 0.24); border-color: #FCFBF8; color: #FFFFFF; }"
+            )
+        for btn in [getattr(self, "stack_btn", None), getattr(self, "hub_stack_btn", None)]:
+            if btn is not None:
+                btn.setText(txt)
+                btn.setStyleSheet(style)
 
     def toggle_ros_stack(self):
         stack_running = (
-            (self.sensor_stack_proc is not None and self.sensor_stack_proc.poll() is None)
+            self._external_stack_online
+            or (self.sensor_stack_proc is not None and self.sensor_stack_proc.poll() is None)
             or (self.slam_stack_proc is not None and self.slam_stack_proc.poll() is None)
         )
         if stack_running:
@@ -3319,16 +4693,38 @@ class ScanHUBOS(QWidget):
         else:
             self.start_ros_stack()
 
+    def _cleanup_all_ros_stack_processes(self):
+        """Ensures no duplicate sensor_bringup, component_container, rslidar_sdk_node, or fastlivo_mapping processes exist."""
+        patterns = [
+            "[m]apping_robosense.launch.py",
+            "[s]ensor_bringup.launch.py",
+            "[f]astlivo_mapping",
+            "[r]slidar_sdk_node",
+            "[c]omponent_container",
+            "[c]amera_container",
+            "[s]canar_topic_relay",
+            "[s]tatic_transform_publisher",
+        ]
+        for pat in patterns:
+            try:
+                subprocess.run(["pkill", "-9", "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
     def start_ros_stack(self):
         ws = "/home/scanar/scanarMini"
-        self.console.append("[STACK] Verifying Airy SYNC_OUT1 and launching ROS 2 Sensor + FAST-LIO2 Stack...")
+        self.console.append("[STACK] Cleaning up any prior nodes, verifying Airy SYNC_OUT1, and launching single-instance ROS 2 Stack...")
         env = os.environ.copy()
         env["ROS_DOMAIN_ID"] = "0"
+        env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
         setup_cmd = (
             f"source /opt/ros/humble/setup.bash && "
             f"source {ws}/install/setup.bash && "
-            f"export ROS_DOMAIN_ID=0"
+            f"export ROS_DOMAIN_ID=0 && "
+            f"export RMW_IMPLEMENTATION=rmw_fastrtps_cpp"
         )
+        self._cleanup_all_ros_stack_processes()
+        time.sleep(0.5)
         try:
             subprocess.Popen(
                 ["python3", f"{ws}/scripts/configure_airy_sync_out.py"],
@@ -3339,20 +4735,18 @@ class ScanHUBOS(QWidget):
 
         try:
             self.sensor_stack_proc = subprocess.Popen(
-                ["bash", "-c", f"{setup_cmd} && exec ros2 launch scan_routine sensor_bringup.launch.py"],
+                ["bash", "-c", f"{setup_cmd} && exec ros2 launch scan_routine sensor_bringup.launch.py >/tmp/scanhub_sensor_bringup.log 2>&1"],
                 cwd=ws, env=env, preexec_fn=os.setsid,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             self.slam_stack_proc = subprocess.Popen(
-                ["bash", "-c", f"{setup_cmd} && sleep 2 && exec ros2 launch fast_livo mapping_robosense.launch.py use_rviz:=false"],
+                ["bash", "-c", f"{setup_cmd} && sleep 2 && exec ros2 launch fast_livo mapping_robosense.launch.py use_rviz:=false >/tmp/scanhub_fast_livo.log 2>&1"],
                 cwd=ws, env=env, preexec_fn=os.setsid,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            self.stack_btn.setText("⏹ STOP STACK")
-            self.stack_btn.setStyleSheet(
-                "background: rgba(239, 68, 68, 0.20); border: 1px solid #F87171; color: #FCA5A5; padding: 6px 14px; border-radius: 9px; font-weight: 600; font-size: 11px;"
-            )
-            self.console.append("[STACK] Launched sensor_bringup.launch.py + mapping_robosense.launch.py (use_rviz:=false).")
+            self._external_stack_online = True
+            self._set_stack_buttons_online(True)
+            self.console.append("[STACK] Single-instance sensor_bringup.launch.py + mapping_robosense.launch.py (use_rviz:=false) ONLINE.")
         except Exception as e:
             self.console.append(f"[STACK ERROR] Failed to start ROS 2 stack: {e}")
 
@@ -3364,15 +4758,12 @@ class ScanHUBOS(QWidget):
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except Exception:
                     pass
+        self._cleanup_all_ros_stack_processes()
         self.slam_stack_proc = None
         self.sensor_stack_proc = None
-        self.stack_btn.setText("🚀 START STACK")
-        self.stack_btn.setStyleSheet(
-            "QPushButton { background: rgba(255, 255, 255, 0.07); border: 1px solid rgba(186, 161, 100, 0.60); "
-            "color: #E5C983; padding: 6px 14px; border-radius: 9px; font-weight: 600; font-size: 11px; }"
-            "QPushButton:hover { background: rgba(186, 161, 100, 0.24); border-color: #FCFBF8; color: #FFFFFF; }"
-        )
-        self.console.append("[STACK] Stopped managed ROS 2 Sensor & SLAM stack.")
+        self._external_stack_online = False
+        self._set_stack_buttons_online(False)
+        self.console.append("[STACK] Stopped ROS 2 Sensor & SLAM stack.")
 
     def update_telemetry_ui(self, t: dict):
         rgb_cov = t.get("rgb_cov_pct", 0.0)
@@ -3393,7 +4784,7 @@ class ScanHUBOS(QWidget):
 
         # Update M12 Live Cleanup Readout
         if not t.get("m12_preview_active", False) and time.time() >= getattr(self, "_m12_status_hold_until", 0.0):
-            m12_on = t.get("m12_live_enabled", True)
+            m12_on = t.get("m12_live_enabled", False)
             in_p = t.get("m12_input_pts", 0)
             out_p = t.get("m12_output_pts", 0)
             ms = t.get("m12_time_ms", 0.0)
@@ -3401,6 +4792,10 @@ class ScanHUBOS(QWidget):
             if m12_on and in_p > 0:
                 self.lbl_m12_status.setText(
                     f"M12 RT: ON | {in_p:,} -> {out_p:,} pts | Tilt: {tilt:.1f}° | {ms:.1f}ms"
+                )
+            elif not m12_on:
+                self.lbl_m12_status.setText(
+                    "M12 RT Filter: OFF (Post-Process Ready — Preview / Commit / Export)"
                 )
 
         # Update C-SLAM Unlimited Multi-Scanner Status
@@ -3427,8 +4822,8 @@ class ScanHUBOS(QWidget):
                 f"padding: 3px 8px; border-radius: 10px; font-weight: 600; font-size: 9px;"
             )
             self.lbl_cslam_summary.setText(
-                f"Project: {cslam.get('project_name', '')} | Scanners: {tot_scanners} "
-                f"| Snapped: {snapped_n} | IMU+Offset: {sep_n}"
+                f"Project: {cslam.get('project_name', '')} / {cslam.get('dataset_name', '')} | "
+                f"Scanners: {tot_scanners} | Snapped: {snapped_n} | IMU+Offset: {sep_n}"
             )
 
             html_lines = [
@@ -3490,6 +4885,11 @@ class ScanHUBOS(QWidget):
             self.dot_slam.setText(f"● SLAM: OK ({slam_hz:.1f}Hz)")
             self.dot_slam.setStyleSheet(f"color: #4ADE80; {pill_base}")
 
+        # Auto-sync START/STOP STACK button if ROS stack is actively publishing
+        if (active_lidar_hz > 1.0 or active_cam_hz > 1.0 or slam_hz > 1.0) and not self._external_stack_online:
+            self._external_stack_online = True
+            self._set_stack_buttons_online(True)
+
         ang_spd = t.get("ang_speed", 0.0)
         lin_spd = t.get("lin_speed", 0.0)
         deg_s = math.degrees(ang_spd)
@@ -3503,13 +4903,122 @@ class ScanHUBOS(QWidget):
             self.dot_pace.setText(f"● PACE: OPTIMAL ({lin_spd:.2f}m/s)")
             self.dot_pace.setStyleSheet(f"color: #4ADE80; {pill_base}")
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_F, ord('F'), ord('f')):
+            if self.is_recording:
+                self.trigger_faro_flash_anchor()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def toggle_scan_workflow(self):
         dataset = self.dataset_input.text().strip().replace(" ", "_")
         if not dataset:
-            dataset = datetime.now().strftime("Scan_%m%d_%H%M")
+            dataset = datetime.now().strftime("Dataset_%m%d_%H%M")
             self.dataset_input.setText(dataset)
+        self.active_dataset_name = dataset
+        self.ros_worker.cslam_engine.set_project_name(self.active_project_name, dataset)
 
-        self.console.append(f"\n[START] Starting Capture Workflow for session: {dataset}")
+        self.console.append(f"\n[START] Starting Capture Workflow -> Project: {self.active_project_name} | Dataset: {dataset}")
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.save_btn.setEnabled(False)
+        self.flash_btn.setEnabled(False)
+        self.map_canvas.clear_map()
+        self.anchor_count = 0
+
+        if not self.is_calibrated:
+            self.run_stage_1_bias_calibration()
+        else:
+            self.start_rotation_ritual()
+
+    def run_stage_1_bias_calibration(self):
+        self.console.append("[INIT] NavVis Ritual Stage 1: Static ZUPT Bias Calibration (Hold scanner motionless)...")
+        self.calib_ticks = 0
+        self.bar.setValue(0)
+        self.btn_skip_ritual.setVisible(True)
+        self.progress_label.setText("STAGE 1 · Static Bias Calibration: Keep scanner motionless (3s)...")
+        self.progress_label.setStyleSheet("color: #E5C983; font-weight: 600; background: transparent;")
+        self.status_bar.showMessage("CALIBRATING: Static bias calibration in progress...")
+
+        self.calib_timer = QTimer()
+        self.calib_timer.timeout.connect(self._sample_bias_tick)
+        self.calib_timer.start(30)  # 100 ticks * 30ms = 3.0 seconds
+
+    def _sample_bias_tick(self):
+        self.calib_ticks += 1
+        progress = min(100, int((self.calib_ticks / 100.0) * 100))
+        self.bar.setValue(progress)
+
+        if self.calib_ticks == 1:
+            self.calib_ax_sum = 0.0
+            self.calib_ay_sum = 0.0
+            self.calib_az_sum = 0.0
+
+        self.calib_ax_sum += self.ros_worker.last_ax
+        self.calib_ay_sum += self.ros_worker.last_ay
+        self.calib_az_sum += self.ros_worker.last_az
+
+        if self.calib_ticks >= 100:
+            if self.calib_timer is not None:
+                self.calib_timer.stop()
+                self.calib_timer = None
+            self.is_calibrated = True
+
+            ax_avg = self.calib_ax_sum / 100.0
+            ay_avg = self.calib_ay_sum / 100.0
+            az_avg = self.calib_az_sum / 100.0
+
+            roll_est = math.atan2(ay_avg, az_avg)
+            pitch_est = math.atan2(-ax_avg, math.hypot(ay_avg, az_avg))
+            roll_est_deg = math.degrees(roll_est)
+            pitch_est_deg = math.degrees(pitch_est)
+
+            self.console.append(
+                f"[SUCCESS] Stage 1 Complete: Gravity aligned! Avg accel: X={ax_avg:+.2f} Y={ay_avg:+.2f} Z={az_avg:+.2f} m/s² "
+                f"(Roll={roll_est_deg:+.1f}°, Pitch={pitch_est_deg:+.1f}°)"
+            )
+            self.map_canvas.gravity_roll_deg = roll_est_deg
+            self.map_canvas.gravity_pitch_deg = pitch_est_deg
+            self.start_rotation_ritual()
+
+    def start_rotation_ritual(self):
+        self.ros_worker.accumulated_rotation_deg = 0.0
+        self.ros_worker.last_imu_gyro_time = time.time()
+        self.ros_worker.in_rotation_ritual = True
+
+        self.bar.setValue(0)
+        self.btn_skip_ritual.setVisible(True)
+        self.console.append("[INIT] NavVis Ritual Stage 2: Pivot scanner 90° horizontally to synchronize SLAM attitude...")
+        self.progress_label.setText("🔄 NAVVIS RITUAL: Slowly pivot scanner 90° horizontally to sync SLAM attitude...")
+        self.progress_label.setStyleSheet("color: #E5C983; font-weight: 600; background: transparent;")
+        self.status_bar.showMessage("NAVVIS RITUAL: Pivot scanner 90° to lock SLAM attitude...")
+
+    def update_rotation_ritual_ui(self, deg: float):
+        progress = min(100, int((deg / 90.0) * 100))
+        self.bar.setValue(progress)
+        self.progress_label.setText(f"🔄 NAVVIS RITUAL: Pivot scanner 90°... ({deg:.0f}° / 90°)")
+        self.progress_label.setStyleSheet("color: #E5C983; font-weight: 600; background: transparent;")
+
+    def skip_rotation_ritual(self):
+        if self.calib_timer is not None:
+            self.calib_timer.stop()
+            self.calib_timer = None
+        self.is_calibrated = True
+        self.ros_worker.in_rotation_ritual = False
+        self.console.append("[INFO] NavVis alignment ritual skipped by user.")
+        self.on_rotation_ritual_completed()
+
+    def on_rotation_ritual_completed(self):
+        self.bar.setValue(100)
+        self.btn_skip_ritual.setVisible(False)
+        self.console.append("[SUCCESS] NavVis 90° Pivot Ritual Locked! SLAM attitude synchronized.")
+        self.progress_label.setText("🟢 90° PIVOT LOCKED! Reality capture recording active...")
+        self.progress_label.setStyleSheet("color: #4ADE80; font-weight: 600; background: transparent;")
+        self.execute_active_capture_pipelines()
+
+    def execute_active_capture_pipelines(self):
+        self.console.append(f"[CAPTURE] Session active: {self.active_dataset_name}")
         self.ros_worker.start_recording_session()
         self.is_recording = True
         self.scan_elapsed_seconds = 0
@@ -3518,10 +5027,25 @@ class ScanHUBOS(QWidget):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.save_btn.setEnabled(False)
-        self.map_canvas.clear_map()
+        self.flash_btn.setEnabled(True)
         self.progress_label.setText("SCANNING IN PROGRESS  ·  Move smoothly to paint scene geometry & truecolor coverage")
         self.progress_label.setStyleSheet("color: #4ADE80; font-weight: 600; background: transparent;")
-        self.status_bar.showMessage(f"SCANNING IN PROGRESS: {dataset}")
+        self.status_bar.showMessage(f"SCANNING IN PROGRESS: {self.active_project_name} / {self.active_dataset_name}")
+
+    def trigger_faro_flash_anchor(self):
+        if not self.is_recording:
+            return
+        label = f"w{self.anchor_count:02d}"
+        self.anchor_count += 1
+        timestamp = datetime.now().strftime("%H:%M:%S")
+
+        cx = self.map_canvas.current_x
+        cy = self.map_canvas.current_y
+        cz = getattr(self.ros_worker, "current_z", 0.0)
+
+        self.map_canvas.add_flash_anchor(label, cx, cy, cz)
+        self.console.append(f"[FARO FLASH SCAN] ⚡ Anchor {label} Captured at X={cx:+.2f}m Y={cy:+.2f}m Z={cz:+.2f}m ({timestamp})")
+        self.status_bar.showMessage(f"⚡ FLASH ANCHOR {label} RECORDED at ({cx:+.2f}, {cy:+.2f})", 4000)
 
     def update_scan_clock_tick(self):
         self.scan_elapsed_seconds += 1
@@ -3530,6 +5054,12 @@ class ScanHUBOS(QWidget):
         self.clock_lbl.setText(f"⏱ {m:02d}:{s:02d}")
 
     def stop_scan_session(self):
+        if self.calib_timer is not None:
+            self.calib_timer.stop()
+            self.calib_timer = None
+        self.ros_worker.in_rotation_ritual = False
+        self.btn_skip_ritual.setVisible(False)
+
         self.console.append("[STOP] Stopping active scan session...")
         self.ros_worker.stop_recording_session()
         self.is_recording = False
@@ -3538,6 +5068,7 @@ class ScanHUBOS(QWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.save_btn.setEnabled(True)
+        self.flash_btn.setEnabled(False)
         self.progress_label.setText("SESSION STOPPED  ·  Ready to SAVE qualified production dataset")
         self.progress_label.setStyleSheet("color: #E5C983; font-weight: 600; background: transparent;")
         self.status_bar.showMessage("SCAN STOPPED: Ready to SAVE production dataset.")
@@ -3545,9 +5076,13 @@ class ScanHUBOS(QWidget):
     def save_dataset(self):
         if self.export_in_progress:
             return
-        dataset = self.dataset_input.text().strip().replace(" ", "_")
-        save_dir = f"/home/scanar/scanarMini/data/{dataset}"
-        self.console.append(f"\n[SAVE] Exporting production dataset in background to:\n  {save_dir}")
+        dataset = self.dataset_input.text().strip().replace(" ", "_") or self.active_dataset_name
+        self.active_dataset_name = dataset
+        save_dir = self._get_active_dataset_save_dir(dataset)
+        legacy_dir = os.path.join(self.legacy_data_root, dataset)
+        self.console.append(
+            f"\n[SAVE] Exporting production dataset in background to Project '{self.active_project_name}':\n  {save_dir}"
+        )
         self.export_in_progress = True
         self.save_btn.setEnabled(False)
         self.progress_label.setText(f"EXPORTING DATASET IN BACKGROUND: {save_dir} ...")
@@ -3565,6 +5100,13 @@ class ScanHUBOS(QWidget):
                     trajectory=traj_snap,
                     flash_anchors=flash_snap,
                 )
+                # Maintain a symlink in /home/scanar/scanarMini/data/<dataset> if saved under projects/
+                try:
+                    os.makedirs(self.legacy_data_root, exist_ok=True)
+                    if os.path.abspath(save_dir) != os.path.abspath(legacy_dir) and not os.path.exists(legacy_dir):
+                        os.symlink(save_dir, legacy_dir)
+                except Exception:
+                    pass
                 self.export_finished.emit(meta, save_dir, "")
             except Exception as e:
                 self.export_finished.emit({}, save_dir, str(e))
@@ -3587,6 +5129,7 @@ class ScanHUBOS(QWidget):
         n_p = meta.get("cslam_peers", 0)
 
         self.console.append("[SUCCESS] Export Complete:")
+        self.console.append(f"  - Project: {self.active_project_name}  |  Dataset: {self.active_dataset_name}")
         self.console.append(f"  - pointcloud_airy.ply / .pcd: {n_a:,} pts (Pure LiDAR Geometry)")
         self.console.append(f"  - pointcloud_stereo.ply / .pcd: {n_s:,} pts (Colorized Stereo)")
         self.console.append(f"  - pointcloud_fused_rgb.ply / .pcd: {n_f:,} pts (Truecolor Fused)")
@@ -3597,9 +5140,12 @@ class ScanHUBOS(QWidget):
         self.progress_label.setText(f"DATASET SAVED: {save_dir}")
         self.progress_label.setStyleSheet("color: #4ADE80; font-weight: 600; background: transparent;")
         self.status_bar.showMessage(f"DATASET SAVED: {save_dir}")
+        self.refresh_projects_hub_lists()
 
     def closeEvent(self, event):
-        self.stop_ros_stack()
+        self.hub_refresh_timer.stop()
+        if self.sensor_stack_proc is not None or self.slam_stack_proc is not None:
+            self.stop_ros_stack()
         self.ros_worker.stop()
         event.accept()
 

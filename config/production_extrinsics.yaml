@@ -11,7 +11,7 @@ metadata:
 
 # Active transforms based on Device 2 (scanarV4) 45-degree experimental results
 active_transforms:
-  # Left IR Cam0 Optical Frame <- RoboSense Airy Native IMU
+  # Left IR Cam0 Optical Frame <- RoboSense Airy Native IMU (FAST-LIVO2 body frame)
   # p_cam0 = T_cam0_airy_imu * p_imu
   T_cam0_airy_imu:
     matrix:
@@ -45,66 +45,67 @@ active_transforms:
 
   # Cam0 Left IR Frame <- RoboSense Airy LiDAR Base Center
   # p_cam0 = T_cam0_airy_lidar * p_lidar
-  # Composed from T_cam0_airy_imu and Airy factory T_airy_lidar_airy_imu inverse
+  # Composed from T_cam0_airy_imu @ T_airy_imu_airy_lidar (matching FAST-LIVO2 extrinsic_R)
   T_cam0_airy_lidar:
     matrix:
-      - [-0.999975,  0.008047,  0.001545,  0.043475]
-      - [-0.004515, -0.698495,  0.715601, -0.050779]
-      - [ 0.006838,  0.715576,  0.698514, -0.029993]
+      - [ 0.015886, -0.999704,  0.018422,  0.043444]
+      - [ 0.714412, -0.001542, -0.699724, -0.063060]
+      - [ 0.699546,  0.024276,  0.714175, -0.029978]
       - [ 0.000000,  0.000000,  0.000000,  1.000000]
-    translation_m: [0.043475, -0.050779, -0.029993]
+    translation_m: [0.043444, -0.063060, -0.029978]
 
   # RGB Color Optical Frame <- RoboSense Airy LiDAR Base Center
   # p_rgb = T_rgb_airy_lidar * p_lidar
   T_rgb_airy_lidar:
     matrix:
-      - [-0.999986,  0.006137,  0.003004,  0.019634]
-      - [-0.002147, -0.699453,  0.714675, -0.050750]
-      - [ 0.006481,  0.714660,  0.699455, -0.029620]
+      - [ 0.015158, -0.999697,  0.019378,  0.067244]
+      - [ 0.713970, -0.002746, -0.700172, -0.063082]
+      - [ 0.700012,  0.024449,  0.713710, -0.030452]
       - [ 0.000000,  0.000000,  0.000000,  1.000000]
-    translation_m: [0.019634, -0.050750, -0.029620]
+    translation_m: [0.067244, -0.063082, -0.030452]
 
-  # RGB Color Optical Frame <- RoboSense Airy IMU Frame
+  # RGB Color Optical Frame <- RoboSense Airy IMU Frame (FAST-LIVO2 body frame)
   # p_rgb = T_rgb_airy_imu * p_imu
+  # Derived from T_rgb_depth @ T_cam0_airy_imu
   T_rgb_airy_imu:
     matrix:
-      - [ 0.999938, -0.001112, -0.011048,  0.015520]
-      - [ 0.002120, -0.717088,  0.696979, -0.056901]
-      - [-0.010903, -0.696982, -0.717006, -0.029665]
+      - [ 0.999936, -0.002759, -0.010962,  0.063044]
+      - [ 0.005675, -0.716106,  0.697968, -0.056937]
+      - [-0.009776, -0.697985, -0.716045, -0.030558]
       - [ 0.000000,  0.000000,  0.000000,  1.000000]
-    translation_m: [0.015520, -0.056901, -0.029665]
+    translation_m: [0.063044, -0.056937, -0.030558]
 
 # Reconstructed CAD Extrinsic References
 cad_references:
   T_cam0_airy_lidar_cad:
     matrix:
-      - [-1.000000,  0.000000,  0.000000,  0.047640]
-      - [ 0.000000, -0.707107,  0.707107, -0.050779]
-      - [ 0.000000,  0.707107,  0.707107, -0.030174]
+      - [ 0.000000, -1.000000,  0.000000,  0.043444]
+      - [ 0.707107,  0.000000, -0.707107, -0.063060]
+      - [ 0.707107,  0.000000,  0.707107, -0.029978]
       - [ 0.000000,  0.000000,  0.000000,  1.000000]
-    translation_m: [0.047640, -0.050779, -0.030174]
+    translation_m: [0.043444, -0.063060, -0.029978]
 
 # Authoritative Factory Calibrations
 factory_transforms:
-  # Authoritative RoboSense Airy Factory DIFOP LiDAR <- IMU Transform (T_airy_lidar_airy_imu)
+  # Authoritative RoboSense Airy LiDAR <- IMU Transform (T_airy_lidar_airy_imu, inverse of FAST-LIVO2 extrinsic_R/T)
   # p_lidar = T_airy_lidar_airy_imu * p_imu
   T_airy_lidar_airy_imu:
     matrix:
-      - [-0.999987763,  0.001956088,  0.001959011,  0.004250849]
-      - [-0.001955766,  0.001370450, -0.999992538,  0.004179787]
-      - [-0.001957848, -0.999992895, -0.001358219, -0.004460931]
-      - [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]
-    translation_m: [0.004250849, 0.004179787, -0.004460931]
+      - [ 0.012366, -0.999919, -0.003080,  0.004250]
+      - [-0.999888, -0.012340, -0.008465,  0.004179]
+      - [ 0.008426,  0.003183, -0.999960, -0.004460]
+      - [ 0.000000,  0.000000,  0.000000,  1.000000]
+    translation_m: [0.004250, 0.004179, -0.004460]
 
-  # Inverted RoboSense Airy Factory DIFOP IMU <- LiDAR Transform (T_airy_imu_airy_lidar)
+  # Authoritative RoboSense Airy IMU <- LiDAR Transform (T_airy_imu_airy_lidar, matching FAST-LIVO2 extrinsic_R/T)
   # p_imu = T_airy_imu_airy_lidar * p_lidar
   T_airy_imu_airy_lidar:
     matrix:
-      - [-0.999987763, -0.001955766, -0.001957848,  0.00425024]
-      - [ 0.001956088,  0.001370450, -0.999992895, -0.00447494]
-      - [ 0.001959011, -0.999992538, -0.001358219,  0.00416537]
-      - [ 0.000000000,  0.000000000,  0.000000000,  1.00000000]
-    translation_m: [0.00425024, -0.00447494, 0.00416537]
+      - [ 0.012366, -0.999888,  0.008426,  0.004164]
+      - [-0.999919, -0.012340,  0.003184,  0.004315]
+      - [-0.003079, -0.008465, -0.999959, -0.004411]
+      - [ 0.000000,  0.000000,  0.000000,  1.000000]
+    translation_m: [0.004164, 0.004315, -0.004411]
 
   # Orbbec Gemini 336L Archived Factory EEPROM Depth -> RGB Optical Transform (T_rgb_depth)
   # p_rgb = T_rgb_depth * p_depth

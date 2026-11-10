@@ -17,7 +17,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 echo "=================================================="
 echo "Launching scanHUB OS v1.0 (scanR Platform)..."

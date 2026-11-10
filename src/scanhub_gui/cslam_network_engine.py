@@ -387,6 +387,7 @@ class CSlamNetworkEngine:
         self,
         scanner_name: str = "ScanHUB-Unit-01",
         project_name: str = "Default_Project",
+        dataset_name: str = "Scan_01",
         listen_port: Optional[int] = None,
         separation_distance_m: float = 15.0,
         min_overlap_ratio: float = 0.18,
@@ -394,6 +395,8 @@ class CSlamNetworkEngine:
         self.local_uuid: str = str(uuid.uuid4())[:12]
         self.scanner_name: str = scanner_name
         self.project_name: str = project_name
+        self.dataset_name: str = dataset_name
+        self.is_recording: bool = False
         self.requested_port: Optional[int] = listen_port
         self.separation_distance_m: float = float(separation_distance_m)
         self.min_overlap_ratio: float = float(min_overlap_ratio)
@@ -402,6 +405,8 @@ class CSlamNetworkEngine:
 
         self._lock = threading.RLock()
         self.peers: Dict[str, PeerScannerSession] = {}
+        self.discovered_network_sessions: Dict[str, Dict] = {}
+        self._discovered_peer_cache: Dict[str, Dict] = {}
         self._next_peer_index: int = 1  # 0 is Local Scanner
 
         # Local scanner state
@@ -490,11 +495,50 @@ class CSlamNetworkEngine:
                 pass
             self._sock = None
 
-    def set_project_name(self, project_name: str):
+    def set_project_name(self, project_name: str, dataset_name: Optional[str] = None):
+        cached_to_promote = []
         with self._lock:
             clean_name = (project_name or "Default_Project").strip()
-            if clean_name != self.project_name:
-                self.project_name = clean_name
+            self.project_name = clean_name
+            if dataset_name is not None:
+                self.dataset_name = (dataset_name or clean_name).strip()
+            for s_uuid, pkt in list(self._discovered_peer_cache.items()):
+                if pkt.get("project_name") == self.project_name and s_uuid not in self.peers:
+                    cached_to_promote.append(dict(pkt))
+        for pkt in cached_to_promote:
+            self.register_or_update_peer_data(
+                scanner_uuid=pkt["scanner_uuid"],
+                scanner_name=pkt["scanner_name"],
+                project_name=pkt["project_name"],
+                pose_xyz=pkt["pose_xyz"],
+                imu_rpy_rad=pkt["imu_rpy_rad"],
+                points_chunk_or_full=pkt.get("points"),
+                is_full_submap=True,
+                ip_address=pkt.get("ip_address", "127.0.0.1"),
+                port=pkt.get("port", self.BASE_UDP_PORT),
+                dataset_name=pkt.get("dataset_name", ""),
+                is_recording=pkt.get("is_recording", True),
+            )
+
+    def set_dataset_name(self, dataset_name: str):
+        with self._lock:
+            self.dataset_name = (dataset_name or "Scan_01").strip()
+
+    def set_recording_active(self, is_recording: bool):
+        with self._lock:
+            self.is_recording = bool(is_recording)
+
+    def get_discovered_network_sessions(self, max_age_sec: float = 15.0) -> List[Dict]:
+        """Returns all active C-SLAM capture sessions discovered across the network (across all projects)."""
+        now = time.time()
+        with self._lock:
+            stale = [k for k, v in self.discovered_network_sessions.items() if (now - v.get("last_seen_ts", 0.0)) > max_age_sec]
+            for k in stale:
+                self.discovered_network_sessions.pop(k, None)
+                self._discovered_peer_cache.pop(k, None)
+            sessions = [dict(v) for v in self.discovered_network_sessions.values()]
+        sessions.sort(key=lambda s: s.get("last_seen_ts", 0.0), reverse=True)
+        return sessions
 
     def set_color_mode(self, mode: CSlamColorMode):
         with self._lock:
@@ -545,6 +589,8 @@ class CSlamNetworkEngine:
             return
         s_name = pkt_dict.get("scanner_name") or pkt_dict.get("name") or f"Peer-{s_uuid[:4]}"
         proj = pkt_dict.get("project_name") or pkt_dict.get("proj") or self.project_name
+        dset = pkt_dict.get("dataset_name") or pkt_dict.get("dataset") or proj
+        is_rec = bool(pkt_dict.get("is_recording", pkt_dict.get("rec", True)))
         pose = tuple(pkt_dict.get("pos_xyz") or pkt_dict.get("pose") or (0.0, 0.0, 0.0))
         imu = tuple(pkt_dict.get("imu_rpy_rad") or pkt_dict.get("imu") or (0.0, 0.0, 0.0))
         raw_pts = pkt_dict.get("points")
@@ -562,6 +608,8 @@ class CSlamNetworkEngine:
             points_chunk_or_full=pts_arr,
             is_full_submap=True,
             ip_address=sender_ip,
+            dataset_name=dset,
+            is_recording=is_rec,
         )
 
     def compute_separated_imu_transform(self, peer: PeerScannerSession) -> np.ndarray:
@@ -605,12 +653,49 @@ class CSlamNetworkEngine:
         is_full_submap: bool = False,
         ip_address: str = "127.0.0.1",
         port: int = BASE_UDP_PORT,
+        dataset_name: str = "",
+        is_recording: bool = True,
     ) -> Optional[PeerScannerSession]:
         """
         Registers a remote scanner (unlimited peers supported) or updates its live pose, IMU orientation, and point cloud.
+        Also records cross-project network sessions so operators in the Projects Hub can discover and join active captures.
         """
         if scanner_uuid == self.local_uuid:
             return None
+
+        now_ts = time.time()
+        eff_dataset = (dataset_name or project_name).strip()
+        n_pts_in = int(len(points_chunk_or_full)) if points_chunk_or_full is not None else 0
+
+        with self._lock:
+            prev_disc = self.discovered_network_sessions.get(scanner_uuid, {})
+            prev_pts_n = prev_disc.get("point_count", 0)
+            self.discovered_network_sessions[scanner_uuid] = {
+                "scanner_uuid": scanner_uuid,
+                "scanner_name": scanner_name,
+                "project_name": project_name,
+                "dataset_name": eff_dataset,
+                "ip_address": ip_address,
+                "port": int(port),
+                "point_count": n_pts_in if n_pts_in > 0 else prev_pts_n,
+                "pose_xyz": (float(pose_xyz[0]), float(pose_xyz[1]), float(pose_xyz[2])),
+                "imu_rpy_rad": (float(imu_rpy_rad[0]), float(imu_rpy_rad[1]), float(imu_rpy_rad[2])),
+                "is_recording": bool(is_recording),
+                "last_seen_ts": now_ts,
+            }
+            self._discovered_peer_cache[scanner_uuid] = {
+                "scanner_uuid": scanner_uuid,
+                "scanner_name": scanner_name,
+                "project_name": project_name,
+                "dataset_name": eff_dataset,
+                "pose_xyz": (float(pose_xyz[0]), float(pose_xyz[1]), float(pose_xyz[2])),
+                "imu_rpy_rad": (float(imu_rpy_rad[0]), float(imu_rpy_rad[1]), float(imu_rpy_rad[2])),
+                "points": points_chunk_or_full.copy() if (points_chunk_or_full is not None and len(points_chunk_or_full) > 0) else self._discovered_peer_cache.get(scanner_uuid, {}).get("points"),
+                "ip_address": ip_address,
+                "port": int(port),
+                "is_recording": bool(is_recording),
+            }
+
         if project_name != self.project_name:
             return None
 
@@ -747,6 +832,7 @@ class CSlamNetworkEngine:
     def get_merged_cslam_scene(
         self,
         local_points_override: Optional[np.ndarray] = None,
+        preserve_local_colors: bool = False,
     ) -> Tuple[np.ndarray, List[Dict]]:
         """
         Returns:
@@ -759,7 +845,7 @@ class CSlamNetworkEngine:
         with self._lock:
             base_local = (
                 local_points_override[:, :6].astype(np.float32)
-                if (local_points_override is not None and len(local_points_override) > 0)
+                if local_points_override is not None
                 else self.local_points.copy()
             )
             color_mode = self.color_mode
@@ -771,7 +857,11 @@ class CSlamNetworkEngine:
 
         cloud_parts: List[np.ndarray] = []
         if len(base_local) > 0:
-            if color_mode == CSlamColorMode.SCANNER_DIFFERENTIATED and len(active_peers) > 0:
+            if (
+                not preserve_local_colors
+                and color_mode == CSlamColorMode.SCANNER_DIFFERENTIATED
+                and len(active_peers) > 0
+            ):
                 cloud_parts.append(apply_scanner_tint(base_local, get_scanner_color_rgb(0)))
             else:
                 cloud_parts.append(base_local)
@@ -846,14 +936,21 @@ class CSlamNetworkEngine:
 
         return merged, peer_descriptors
 
-    def get_status_summary(self) -> Dict:
+    def get_status_summary(self, peer_descriptors: Optional[List[Dict]] = None) -> Dict:
         """Returns a thread-safe status dictionary for UI telemetry and multi-scanner status panels."""
-        _, peer_descriptors = self.get_merged_cslam_scene()
         with self._lock:
             proj = self.project_name
             loc_name = self.scanner_name
             loc_pts = int(len(self.local_points))
             c_mode = self.color_mode.value
+            has_peers = any(p.project_name == self.project_name for p in self.peers.values())
+        if peer_descriptors is None:
+            if has_peers:
+                _, peer_descriptors = self.get_merged_cslam_scene(
+                    local_points_override=np.zeros((0, 6), dtype=np.float32)
+                )
+            else:
+                peer_descriptors = []
         snapped_n = sum(1 for p in peer_descriptors if p["is_snapped"])
         sep_n = sum(1 for p in peer_descriptors if not p["is_snapped"])
         return {
@@ -876,9 +973,11 @@ class CSlamNetworkEngine:
         self,
         peer_name: Optional[str] = None,
         start_non_overlapping_seconds: float = 1.6,
+        project_name: Optional[str] = None,
+        dataset_name: Optional[str] = None,
     ) -> str:
         """
-        Spawns a live simulated remote scanner joining the current project.
+        Spawns a live simulated remote scanner joining the current or specified project/dataset.
         - Phase 1 (first `start_non_overlapping_seconds`): Scans a separate area with NO overlap with the local scan.
           It is displayed at the non-overlapping offset distance, oriented by its relative IMU heading.
         - Phase 2 (after `start_non_overlapping_seconds`): The simulated peer walks into the overlapping room geometry
@@ -922,7 +1021,8 @@ class CSlamNetworkEngine:
 
                 with self._lock:
                     loc_pts = self.local_points.copy()
-                    proj = self.project_name
+                    proj = project_name if project_name else self.project_name
+                    dset = dataset_name if dataset_name else self.dataset_name
 
                 if elapsed < start_non_overlapping_seconds or len(loc_pts) < 100:
                     # Generate non-overlapping distant structure in peer's local frame
@@ -944,6 +1044,8 @@ class CSlamNetworkEngine:
                         imu_rpy_rad=imu_rpy,
                         points_chunk_or_full=chunk,
                         is_full_submap=True,
+                        dataset_name=dset,
+                        is_recording=True,
                     )
                 else:
                     # Peer walks into overlapping region of the local scan!
@@ -980,6 +1082,8 @@ class CSlamNetworkEngine:
                         imu_rpy_rad=imu_rpy,
                         points_chunk_or_full=peer_cloud,
                         is_full_submap=True,
+                        dataset_name=dset,
+                        is_recording=True,
                     )
 
                 time.sleep(0.35)
@@ -994,6 +1098,8 @@ class CSlamNetworkEngine:
             for k in list(self._sim_stop_flags.keys()):
                 self._sim_stop_flags[k] = True
                 self.peers.pop(k, None)
+                self.discovered_network_sessions.pop(k, None)
+                self._discovered_peer_cache.pop(k, None)
             self._sim_stop_flags.clear()
         if self.on_state_changed is not None:
             try:
@@ -1007,6 +1113,8 @@ class CSlamNetworkEngine:
                 self._sim_stop_flags[k] = True
             self._sim_stop_flags.clear()
             self.peers.clear()
+            self.discovered_network_sessions.clear()
+            self._discovered_peer_cache.clear()
             self._next_peer_index = 1
         if self.on_state_changed is not None:
             try:
@@ -1031,6 +1139,8 @@ class CSlamNetworkEngine:
                 "uuid": self.local_uuid,
                 "name": self.scanner_name,
                 "proj": self.project_name,
+                "dataset": self.dataset_name,
+                "rec": bool(self.is_recording),
                 "port": self._bound_port,
                 "pose": list(self.local_pose_xyz),
                 "imu": list(self.local_imu_rpy_rad),
@@ -1087,6 +1197,8 @@ class CSlamNetworkEngine:
             is_full_submap=True,
             ip_address=addr[0],
             port=int(meta.get("port", addr[1])),
+            dataset_name=meta.get("dataset", "Scan_01"),
+            is_recording=bool(meta.get("rec", n_pts > 0)),
         )
 
     def _network_tx_loop(self):

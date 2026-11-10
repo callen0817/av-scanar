@@ -38,6 +38,8 @@ def generate_launch_description():
             'enable_right_ir': 'false',
             'enable_color': 'true',
             'enable_depth': 'true',
+            'enable_point_cloud': 'false',
+            'enable_colored_point_cloud': 'false',
             'enable_laser': 'true', # Production: Laser ON by default for active stereo depth
             'enable_ir_auto_exposure': 'true', # Production: Auto-exposure enabled for robust tracking
             'ir_exposure': '12000', # Production: Max exposure capped at 12ms (12000 us)
@@ -90,16 +92,16 @@ def generate_launch_description():
                    'rslidar', 'airy_imu']
     )
 
-    # T_cam0_lidar translation: [+0.043475, -0.050779, -0.029993] m (scanarV4 45-deg)
+    # T_cam0_lidar translation: [+0.043444, -0.063060, -0.029978] m (scanarV4 45-deg)
     # Inverted T_lidar_cam0 for ROS static TF:
-    # Translation: [+0.043450, -0.014356, +0.057221] m
-    # Quaternion [qx, qy, qz, qw]: [0.002274, 0.388254, 0.921543, 0.003408]
+    # Translation: [+0.065332, +0.044062, -0.023515] m
+    # Quaternion [qx, qy, qz, qw]: [-0.275342, 0.259035, -0.651888, 0.657366]
     tf_lidar_to_cam0 = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='tf_lidar_to_cam0',
-        arguments=['0.043450', '-0.014356', '0.057221', 
-                   '0.002274', '0.388254', '0.921543', '0.003408', 
+        arguments=['0.065332', '0.044062', '-0.023515', 
+                   '-0.275342', '0.259035', '-0.651888', '0.657366', 
                    'rslidar', 'camera_left_ir_optical_frame']
     )
 

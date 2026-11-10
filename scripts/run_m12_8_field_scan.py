@@ -53,11 +53,11 @@ t_IMU_LIDAR = np.array([0.004164, 0.004315, -0.004411], dtype=np.float64)
 
 # 2. Camera Depth Optical Frame (Left IR) from LiDAR Frame (scanarV4_45deg)
 R_CAM_LIDAR = np.array([
-    [-0.999975,  0.008047,  0.001545],
-    [-0.004515, -0.698495,  0.715601],
-    [ 0.006838,  0.715576,  0.698514]
+    [ 0.015886, -0.999704,  0.018422],
+    [ 0.714412, -0.001542, -0.699724],
+    [ 0.699546,  0.024276,  0.714175]
 ], dtype=np.float64)
-t_CAM_LIDAR = np.array([0.043475, -0.050779, -0.029993], dtype=np.float64)
+t_CAM_LIDAR = np.array([0.043444, -0.063060, -0.029978], dtype=np.float64)
 
 # 5. RGB Optical Frame from Camera Depth Optical Frame (Factory EEPROM T_rgb_depth)
 R_RGB_CAM_DEPTH = np.array([

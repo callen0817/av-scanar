@@ -47,3 +47,9 @@ diagnostics/**/*.pcd
 
 # Editor settings
 .vscode/
+
+# Scanned project outputs and runtime symlinks
+projects/
+data/Corridor_Scan_A
+data/Ritual_Corridor_01
+
