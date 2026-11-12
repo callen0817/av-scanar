@@ -20,6 +20,7 @@ class ExportFormat(Enum):
     PCD_BINARY = "PCD_BINARY"
     XYZ_ASCII = "XYZ_ASCII"
     OBJ_MESH = "OBJ_MESH"
+    E57_STRUCTURED = "E57_STRUCTURED"
 
 
 @dataclass
@@ -558,6 +559,8 @@ class PointCloudProcessor:
     @staticmethod
     def parse_export_format(format_str: str) -> ExportFormat:
         s = (format_str or "").upper()
+        if "E57" in s:
+            return ExportFormat.E57_STRUCTURED
         if "PLY" in s and "BIN" in s:
             return ExportFormat.PLY_BINARY
         if "PLY" in s:
@@ -574,6 +577,8 @@ class PointCloudProcessor:
 
     @staticmethod
     def export_format_extension(fmt: ExportFormat) -> str:
+        if fmt == ExportFormat.E57_STRUCTURED:
+            return ".e57"
         if fmt in (ExportFormat.PLY_ASCII, ExportFormat.PLY_BINARY):
             return ".ply"
         if fmt in (ExportFormat.PCD_ASCII, ExportFormat.PCD_BINARY):
@@ -593,6 +598,7 @@ class PointCloudProcessor:
             ExportFormat.PCD_BINARY: "PCD (Binary)",
             ExportFormat.XYZ_ASCII: "XYZRGBI (ASCII)",
             ExportFormat.OBJ_MESH: "Wavefront OBJ (3D Surface Mesh)",
+            ExportFormat.E57_STRUCTURED: "ASTM E57 (Structured Station + 360° Panorama)",
         }
         return names.get(fmt, "PLY (ASCII)")
 
@@ -870,6 +876,53 @@ class PointCloudProcessor:
                 res.success = True
                 res.exported_points = m_n
                 res.exported_triangles = len(triangles)
+
+            elif fmt == ExportFormat.E57_STRUCTURED:
+                import cv2 as _cv2
+                try:
+                    from .av_structure_engine import (
+                        StationGenerationConfig,
+                        VirtualStationGenerator,
+                        VirtualStationSelector,
+                    )
+                    from .e57_structured_writer import E57StationPayload, write_structured_e57
+                except ImportError:
+                    from av_structure_engine import (
+                        StationGenerationConfig,
+                        VirtualStationGenerator,
+                        VirtualStationSelector,
+                    )
+                    from e57_structured_writer import E57StationPayload, write_structured_e57
+
+                st_cfg = StationGenerationConfig(scan_rows=256, scan_cols=1024, pano_width=2048, pano_height=1024)
+                stations = VirtualStationSelector.select_stations(st_cfg, points_xyz=xyz)
+                gen = VirtualStationGenerator(st_cfg)
+                payloads = []
+                total_val = 0
+                for st in stations:
+                    s_res = gen.synthesize_station(st, xyz, rgb_u8)
+                    pano_bgr = _cv2.cvtColor(s_res.panorama_rgb, _cv2.COLOR_RGB2BGR)
+                    ok_j, jpg_b = _cv2.imencode(".jpg", pano_bgr, [int(_cv2.IMWRITE_JPEG_QUALITY), 93])
+                    payloads.append(
+                        E57StationPayload(
+                            station_id=st.station_id,
+                            station_name=st.station_id,
+                            description=f"AV Structure Virtual Station ({st.source_mode})",
+                            translation_xyz=(float(st.position_xyz[0]), float(st.position_xyz[1]), float(st.position_xyz[2])),
+                            rotation_wxyz=st.rotation_wxyz,
+                            xyz_local=s_res.scan_xyz_local,
+                            invalid_state=s_res.scan_invalid_state,
+                            rgb=s_res.scan_rgb,
+                            panorama_jpeg_bytes=jpg_b.tobytes() if ok_j else None,
+                            panorama_width=st_cfg.pano_width,
+                            panorama_height=st_cfg.pano_height,
+                        )
+                    )
+                    total_val += s_res.valid_scan_points
+
+                write_structured_e57(output_path, payloads)
+                res.success = True
+                res.exported_points = total_val
 
             if os.path.exists(output_path):
                 res.file_size_bytes = os.path.getsize(output_path)

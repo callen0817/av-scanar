@@ -82,6 +82,7 @@ except ImportError:
 
 # Ensure local gui directory is on sys.path for direct module imports
 _GUI_DIR = os.path.dirname(os.path.abspath(__file__))
+_WS_DIR = os.path.abspath(os.path.join(_GUI_DIR, "..", ".."))
 if _GUI_DIR not in sys.path:
     sys.path.insert(0, _GUI_DIR)
 
@@ -99,6 +100,22 @@ from cslam_network_engine import (
     get_scanner_color_hex,
     get_scanner_color_rgb,
 )
+from av_structure_engine import (
+    IntelligentKeyframeSelector,
+    KeyframeCaptureConfig,
+    PanoramaProvenance,
+    RgbKeyframe,
+    StationGenerationConfig,
+    StationPlacementMode,
+    StationSynthesisResult,
+    VirtualStation,
+    VirtualStationGenerator,
+    VirtualStationSelector,
+    export_av_structure_bundle,
+    load_keyframes_bundle,
+    save_keyframes_bundle,
+)
+from e57_structured_writer import read_and_validate_e57
 
 # Import local scanHUB engine modules
 try:
@@ -169,7 +186,7 @@ CAM_FWD_AXIS_IMU = R_IMU_CAM_DEPTH @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
 if _yaml is not None:
     try:
-        _fl_path = "/home/scanar/scanarMini/src/FAST-LIVO2/config/robosense.yaml"
+        _fl_path = os.path.join(_WS_DIR, "src", "FAST-LIVO2", "config", "robosense.yaml")
         if os.path.exists(_fl_path):
             with open(_fl_path, "r") as _f:
                 _fl_cfg = _yaml.safe_load(_f)
@@ -177,7 +194,7 @@ if _yaml is not None:
             R_IMU_LIDAR = np.array(_ext["extrinsic_R"], dtype=np.float64).reshape(3, 3)
             t_IMU_LIDAR = np.array(_ext["extrinsic_T"], dtype=np.float64)
 
-        _pe_path = "/home/scanar/scanarMini/config/production_extrinsics.yaml"
+        _pe_path = os.path.join(_WS_DIR, "config", "production_extrinsics.yaml")
         if os.path.exists(_pe_path):
             with open(_pe_path, "r") as _f:
                 _pe_cfg = _yaml.safe_load(_f)
@@ -316,8 +333,8 @@ def multi_sweep_voxel_centroids(sweeps, voxel_size=0.015):
 # ==============================================================================
 AV_LOGO_CANDIDATES = [
     os.path.join(_GUI_DIR, "assets", "av_logo.png"),
-    "/home/scanar/scanarMini/src/scanhub_gui/assets/av_logo.png",
-    "/home/scanar/scanarMini/gui/av_logo.png",
+    os.path.join(_WS_DIR, "src", "scanhub_gui", "assets", "av_logo.png"),
+    os.path.join(_WS_DIR, "gui", "av_logo.png"),
 ]
 
 AV_THEME = {
@@ -752,6 +769,94 @@ class Ros2BridgeWorker(QThread):
             min_overlap_ratio=0.18,
         )
         self.cslam_engine.start()
+
+        # Milestone M15: AV Structure — Intelligent RGB Keyframe Selector & Virtual Station Generator
+        self.keyframe_selector = IntelligentKeyframeSelector()
+        self.m15_station_config = StationGenerationConfig()
+        self.live_virtual_stations: List[VirtualStation] = []
+        self.last_station_results: List[StationSynthesisResult] = []
+        self._pending_force_keyframe_reason: Optional[str] = None
+
+    def register_live_virtual_station(
+        self,
+        label: str,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float = 0.0,
+        source_mode: str = "manual_flash",
+    ) -> VirtualStation:
+        """Registers an explicit Virtual Scan Station (FARO Flash or Map Marker) and queues priority RGB capture."""
+        with self.lock:
+            st = VirtualStation(
+                station_id=f"station_{len(self.live_virtual_stations):02d}_{label}",
+                label=label,
+                position_xyz=np.array([float(x), float(y), float(z)], dtype=np.float64),
+                yaw_rad=float(yaw),
+                source_mode=source_mode,
+                timestamp_sec=time.time(),
+            )
+            self.live_virtual_stations.append(st)
+            self._pending_force_keyframe_reason = f"{source_mode}_{label}"
+            # Retroactively evaluate angular RGB coverage from already-captured keyframes
+            for kf in self.keyframe_selector.keyframes:
+                hfov = 2.0 * math.degrees(math.atan2(kf.width * 0.5, max(1.0, kf.fx)))
+                self.keyframe_selector.update_stations_live_coverage(
+                    [st], kf.camera_center_world, kf.forward_axis_world, hfov_deg=hfov
+                )
+        return st
+
+    def synthesize_virtual_stations(
+        self,
+        flash_anchors: Optional[List[Dict]] = None,
+        canvas_trajectory: Optional[List[Tuple]] = None,
+    ) -> List[StationSynthesisResult]:
+        """Synthesizes Virtual Scan Stations (Structured 3D Scans + 360° Panoramas) on active cloud."""
+        self.ensure_local_cloud_for_interactive_ops()
+        with self.lock:
+            a_arr, s_arr = self._get_voxel_arrays_locked()
+            pts_3d = self.extract_raw_3d_points_for_mode("colorized_fused", a_arr, s_arr)
+            st_cfg = StationGenerationConfig(
+                placement_mode=self.m15_station_config.placement_mode,
+                auto_spacing_m=self.m15_station_config.auto_spacing_m,
+                scan_rows=self.m15_station_config.scan_rows,
+                scan_cols=self.m15_station_config.scan_cols,
+                pano_width=self.m15_station_config.pano_width,
+                pano_height=self.m15_station_config.pano_height,
+                max_reproj_baseline_m=self.m15_station_config.max_reproj_baseline_m,
+                enable_small_gap_fill=self.m15_station_config.enable_small_gap_fill,
+            )
+            kfs = list(self.keyframe_selector.keyframes)
+            traj_recs = list(self.trajectory_records) if len(self.trajectory_records) > 0 else list(canvas_trajectory or [])
+
+        if len(pts_3d) == 0:
+            return []
+
+        xyz = pts_3d[:, :3].astype(np.float64)
+        rgb = np.clip(pts_3d[:, 3:6], 0, 255).astype(np.uint8)
+        # Identify points colored by RGB vs default structural slate [70,75,85] / [64,68,78] / [175,175,175]
+        is_slate = (
+            ((rgb[:, 0] == 70) & (rgb[:, 1] == 75) & (rgb[:, 2] == 85))
+            | ((rgb[:, 0] == 64) & (rgb[:, 1] == 68) & (rgb[:, 2] == 78))
+            | ((rgb[:, 0] == 175) & (rgb[:, 1] == 175) & (rgb[:, 2] == 175))
+        )
+        has_true_rgb = ~is_slate
+
+        stations = VirtualStationSelector.select_stations(
+            st_cfg,
+            flash_anchors=flash_anchors,
+            trajectory_records=traj_recs,
+            keyframes=kfs,
+            points_xyz=xyz,
+        )
+        gen = VirtualStationGenerator(st_cfg)
+        results = [
+            gen.synthesize_station(st, xyz, rgb, points_has_true_rgb=has_true_rgb, keyframes=kfs)
+            for st in stations
+        ]
+        with self.lock:
+            self.last_station_results = results
+        return results
 
     def set_gating_parameters(self, min_d, max_d, agree_tol, conf_thresh):
         with self.lock:
@@ -1259,6 +1364,41 @@ class Ros2BridgeWorker(QThread):
                             self.latest_color_stamp = sec_aligned
                             self._rgb_seq += 1
                             self.rgb_ring.append((sec_aligned, rgb))
+                            is_rec = self.is_session_recording
+                            force_reason = self._pending_force_keyframe_reason
+                            if force_reason is not None:
+                                self._pending_force_keyframe_reason = None
+                            fx_r, fy_r, cx_r, cy_r = self.fx_rgb, self.fy_rgb, self.cx_rgb, self.cy_rgb
+                            d_r = self.d_rgb.copy()
+                            live_sts = list(self.live_virtual_stations)
+
+                        # Milestone M15: Continuous Intelligent Multi-Trigger RGB Keyframe Selection
+                        if is_rec or force_reason is not None:
+                            pose_kf = self.get_interpolated_odom(sec_aligned, require_bracketed=False, max_clamp_dt=0.35)
+                            if pose_kf is not None and pose_kf != "WAIT":
+                                pos_k, quat_k = pose_kf
+                                R_w_imu_k = Rotation.from_quat(quat_k).as_matrix()
+                                R_rw, t_rw = IntelligentKeyframeSelector.compose_rgb_world_extrinsics(
+                                    pos_k, R_w_imu_k, R_RGB_IMU, t_RGB_IMU
+                                )
+                                with self.lock:
+                                    kf_added = self.keyframe_selector.consider_frame(
+                                        timestamp_sec=sec_aligned,
+                                        image_rgb=rgb,
+                                        fx=fx_r,
+                                        fy=fy_r,
+                                        cx=cx_r,
+                                        cy=cy_r,
+                                        R_rgb_world=R_rw,
+                                        t_rgb_world=t_rw,
+                                        dist_coeffs=d_r,
+                                        R_world_imu=R_w_imu_k,
+                                        pos_world_imu=pos_k,
+                                        active_stations=live_sts,
+                                        force_reason=force_reason,
+                                    )
+                                    if kf_added is not None:
+                                        self.rgb_keyframes.append((sec_aligned, rgb, R_w_imu_k, pos_k))
                 except Exception:
                     pass
 
@@ -1381,10 +1521,27 @@ class Ros2BridgeWorker(QThread):
                     pos_c, quat_c = rgb_w_pose
                     R_w_imu_c = Rotation.from_quat(quat_c).as_matrix()
 
-                    # Save bracketed keyframe if recording
+                    # Save quality-controlled keyframe if recording (via M15 IntelligentKeyframeSelector)
                     if is_rec:
+                        R_rw_c, t_rw_c = IntelligentKeyframeSelector.compose_rgb_world_extrinsics(
+                            pos_c, R_w_imu_c, R_RGB_IMU, t_RGB_IMU
+                        )
                         with self.lock:
-                            if len(self.rgb_keyframes) == 0 or (rgb_sec - self.rgb_keyframes[-1][0] >= 0.20):
+                            kf_c = self.keyframe_selector.consider_frame(
+                                timestamp_sec=rgb_sec,
+                                image_rgb=rgb_img,
+                                fx=self.fx_rgb,
+                                fy=self.fy_rgb,
+                                cx=self.cx_rgb,
+                                cy=self.cy_rgb,
+                                R_rgb_world=R_rw_c,
+                                t_rgb_world=t_rw_c,
+                                dist_coeffs=d_rgb,
+                                R_world_imu=R_w_imu_c,
+                                pos_world_imu=pos_c,
+                                active_stations=self.live_virtual_stations,
+                            )
+                            if kf_c is not None:
                                 self.rgb_keyframes.append((rgb_sec, rgb_img, R_w_imu_c, pos_c))
 
                     p_imu_c = (xyz_u - pos_c) @ R_w_imu_c
@@ -2003,6 +2160,13 @@ class Ros2BridgeWorker(QThread):
         ceil_pct = (elev_stats.get("ceiling", 0) / t_elev) * 100.0
 
         cslam_summary = self.cslam_engine.get_status_summary()
+        with self.lock:
+            m15_kf_cnt = len(self.keyframe_selector.keyframes)
+            m15_blur_rej = self.keyframe_selector.rejected_blur_count
+            m15_live_sts = [
+                {"label": st.label, "cov_pct": st.azimuth_coverage_pct}
+                for st in self.live_virtual_stations
+            ]
 
         telemetry = {
             "n_airy": n_airy,
@@ -2039,6 +2203,9 @@ class Ros2BridgeWorker(QThread):
             "m12_output_pts": stats_snap.output_points,
             "m12_tilt_deg": stats_snap.ground_result.tilt_angle_deg,
             "cslam": cslam_summary,
+            "m15_keyframes": m15_kf_cnt,
+            "m15_blur_rejected": m15_blur_rej,
+            "m15_stations": m15_live_sts,
         }
         self.telemetry_updated.emit(telemetry)
 
@@ -2169,6 +2336,10 @@ class Ros2BridgeWorker(QThread):
             self.airy_sweeps.clear()
             self.gemini_frames.clear()
             self.rgb_keyframes.clear()
+            self.keyframe_selector.reset()
+            self.live_virtual_stations.clear()
+            self.last_station_results.clear()
+            self._pending_force_keyframe_reason = None
             self._raw_rgb_queue.clear()
             self._raw_depth_queue.clear()
             self._raw_lidar_queue.clear()
@@ -2190,6 +2361,18 @@ class Ros2BridgeWorker(QThread):
             sweeps = list(self.airy_sweeps)
             g_frames = list(self.gemini_frames)
             keyframes = list(self.rgb_keyframes)
+            m15_kfs = list(self.keyframe_selector.keyframes)
+            m15_cfg = StationGenerationConfig(
+                placement_mode=self.m15_station_config.placement_mode,
+                auto_spacing_m=self.m15_station_config.auto_spacing_m,
+                scan_rows=self.m15_station_config.scan_rows,
+                scan_cols=self.m15_station_config.scan_cols,
+                pano_width=self.m15_station_config.pano_width,
+                pano_height=self.m15_station_config.pano_height,
+                max_reproj_baseline_m=self.m15_station_config.max_reproj_baseline_m,
+                enable_small_gap_fill=self.m15_station_config.enable_small_gap_fill,
+            )
+            traj_recs = list(self.trajectory_records)
             dur = self.session_duration
             min_d = self.depth_min_m
             max_d = self.depth_max_m
@@ -2348,6 +2531,70 @@ class Ros2BridgeWorker(QThread):
         with open(os.path.join(save_dir, "flash_anchors.json"), 'w') as fa:
             json.dump(flash_anchors, fa, indent=2)
 
+        # 6. Milestone M15 (AV Structure): Persist Calibrated RGB Keyframes, Virtual Stations, 360° Panoramas & Structured E57
+        kf_saved_count = 0
+        stations_manifest_info = {"station_count": 0, "structured_e57_file": None}
+        if len(m15_kfs) > 0:
+            IntelligentKeyframeSelector.update_keyframe_poses_from_trajectory(
+                m15_kfs, traj_recs, R_RGB_IMU, t_RGB_IMU
+            )
+            kf_bundle = save_keyframes_bundle(m15_kfs, save_dir, jpeg_quality=94)
+            kf_saved_count = int(kf_bundle.get("saved_count", 0))
+
+        # Use fused_xyz/fused_rgb (or fallback to live voxel buffer if session exported without sweep arrays)
+        station_xyz = fused_xyz
+        station_rgb = fused_rgb
+        if len(station_xyz) == 0:
+            with self.lock:
+                a_v, s_v = self._get_voxel_arrays_locked()
+                live_pts = self.extract_raw_3d_points_for_mode("colorized_fused", a_v, s_v)
+            if len(live_pts) > 0:
+                station_xyz = live_pts[:, :3].astype(np.float64)
+                station_rgb = np.clip(live_pts[:, 3:6], 0, 255).astype(np.uint8)
+
+        if len(station_xyz) > 0:
+            has_true_col = ~(
+                ((station_rgb[:, 0] == 175) & (station_rgb[:, 1] == 175) & (station_rgb[:, 2] == 175))
+                | ((station_rgb[:, 0] == 70) & (station_rgb[:, 1] == 75) & (station_rgb[:, 2] == 85))
+                | ((station_rgb[:, 0] == 64) & (station_rgb[:, 1] == 68) & (station_rgb[:, 2] == 78))
+            )
+            traj_for_stations = traj_recs if len(traj_recs) > 0 else list(trajectory or [])
+            v_stations = VirtualStationSelector.select_stations(
+                m15_cfg,
+                flash_anchors=flash_anchors,
+                trajectory_records=traj_for_stations,
+                keyframes=m15_kfs,
+                points_xyz=station_xyz,
+            )
+            v_gen = VirtualStationGenerator(m15_cfg)
+            st_results = [
+                v_gen.synthesize_station(
+                    st, station_xyz, station_rgb, points_has_true_rgb=has_true_col, keyframes=m15_kfs
+                )
+                for st in v_stations
+            ]
+            with self.lock:
+                self.last_station_results = st_results
+            parent_dir = os.path.dirname(os.path.normpath(save_dir))
+            avproj_root = (
+                os.path.dirname(parent_dir)
+                if os.path.basename(parent_dir) == "datasets"
+                else os.path.join(save_dir, "av_showcase")
+            )
+            proj_title = os.path.basename(avproj_root) if os.path.basename(parent_dir) == "datasets" else dataset_name
+            stations_manifest_info = export_av_structure_bundle(
+                save_dir=save_dir,
+                results=st_results,
+                export_e57=True,
+                e57_filename="structured_stations.e57",
+                jpeg_quality=m15_cfg.jpeg_quality,
+                points_xyz=station_xyz,
+                points_rgb=station_rgb,
+                project_name=proj_title,
+                scan_id=dataset_name,
+                av_showcase_project_dir=avproj_root,
+            )
+
         # Metadata JSON
         meta = {
             "session_id": dataset_name,
@@ -2358,6 +2605,12 @@ class Ros2BridgeWorker(QThread):
             "fused_points": int(len(fused_xyz)),
             "cslam_peers": int(len(cslam_peers)),
             "cslam_merged_points": int(len(cslam_merged)),
+            "rgb_keyframes_saved": kf_saved_count,
+            "virtual_stations_count": int(stations_manifest_info.get("station_count", 0)),
+            "floor_count": int(stations_manifest_info.get("floor_count", 1)),
+            "structured_e57_file": stations_manifest_info.get("structured_e57_file"),
+            "av_walkthrough_bundle_file": "av_walkthrough_bundle.json" if stations_manifest_info.get("av_walkthrough_bundle_path") else None,
+            "av_showcase_avproj_path": stations_manifest_info.get("av_showcase_avproj_path"),
             "depth_range_gate_m": [min_d, max_d],
             "surface_agreement_tolerance_m": agree_tol,
             "spatial_bounding_box": {
@@ -2462,6 +2715,8 @@ class RealityCaptureMapCanvas(QFrame):
     M12 Real-Time Cleanup Indicator, and Unlimited-Peer C-SLAM Multi-Scanner Overlay.
     Styled in Apple Glass (visionOS) + Artificial Vision White & Gold Translucent AR aesthetic.
     """
+    station_placed_on_map = pyqtSignal(float, float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._map_lock = threading.Lock()
@@ -2519,16 +2774,63 @@ class RealityCaptureMapCanvas(QFrame):
         self.total_distance = 0.0
         self.update()
 
-    def add_flash_anchor(self, label: str, x: float, y: float, z: float = 0.0):
+    def add_flash_anchor(
+        self,
+        label: str,
+        x: float,
+        y: float,
+        z: float = 0.0,
+        yaw: float = 0.0,
+        source_mode: str = "manual_flash",
+    ):
         with self._map_lock:
             self.flash_anchors.append({
                 "label": label,
                 "x": float(x),
                 "y": float(y),
                 "z": float(z),
+                "yaw": float(yaw),
+                "source_mode": source_mode,
+                "cov_pct": 0.0,
                 "time": time.time(),
             })
         self.update()
+
+    def update_station_coverages(self, live_stations: List[Dict]):
+        if not live_stations:
+            return
+        cov_by_lbl = {s["label"]: float(s.get("cov_pct", 0.0)) for s in live_stations if "label" in s}
+        changed = False
+        with self._map_lock:
+            for anc in self.flash_anchors:
+                lbl = anc.get("label")
+                if lbl in cov_by_lbl and abs(anc.get("cov_pct", 0.0) - cov_by_lbl[lbl]) > 0.5:
+                    anc["cov_pct"] = cov_by_lbl[lbl]
+                    changed = True
+        if changed:
+            self.update()
+
+    def mousePressEvent(self, event):
+        right_btn = Qt.MouseButton.RightButton if hasattr(Qt, "MouseButton") else Qt.RightButton
+        if event.button() == right_btn:
+            pos = event.position() if hasattr(event, "position") else event.pos()
+            sx, sy = float(pos.x()), float(pos.y())
+            w, h = self.width(), self.height()
+            cx, cy = w * 0.5, h * 0.5
+            sc = max(1e-3, float(self.scale))
+            rx = (sx - cx) / sc
+            ry = (cy - sy) / sc
+            rot_ang = (math.pi / 2.0) - self.current_yaw
+            cos_y = math.cos(rot_ang)
+            sin_y = math.sin(rot_ang)
+            dx = rx * cos_y + ry * sin_y
+            dy = -rx * sin_y + ry * cos_y
+            wx = self.current_x + dx
+            wy = self.current_y + dy
+            self.station_placed_on_map.emit(wx, wy)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def update_map_points(self, data: dict):
         pts = data.get("points", None)
@@ -2705,19 +3007,28 @@ class RealityCaptureMapCanvas(QFrame):
                     tag = f"SNAPPED {peer.get('overlap_ratio', 0.0)*100:.0f}%" if is_snapped else "IMU+OFFSET"
                     painter.drawText(px_s + 10, py_s + 4, f"{peer.get('scanner_name', 'Peer')} [{tag}]")
 
-            # 2C. FARO Flash Scan Waypoint Anchors (Pulsating Gold Waypoint Pins)
+            # 2C. Virtual Scan Stations & FARO Flash Waypoint Anchors (Gold Pins + 360° RGB Coverage Arc)
             with self._map_lock:
                 anchors_snap = list(self.flash_anchors)
 
             for anchor in anchors_snap:
                 ax, ay = anchor["x"], anchor["y"]
                 label = anchor.get("label", "w00")
+                cov_pct = float(anchor.get("cov_pct", 0.0))
                 asx, asy = world_to_screen(ax, ay)
                 if -25 <= asx < w + 25 and -25 <= asy < h + 25:
                     # Outer translucent halo ring
-                    painter.setPen(QPen(QColor(229, 201, 131, 160), 1.5))
-                    painter.setBrush(QColor(186, 161, 100, 50))
+                    painter.setPen(QPen(QColor(229, 201, 131, 150), 1.4))
+                    painter.setBrush(QColor(186, 161, 100, 46))
                     painter.drawEllipse(QPointF(asx, asy), 8.5, 8.5)
+
+                    # Live 360° RGB Panoramic Azimuth Coverage Arc
+                    if cov_pct > 0.5:
+                        span_16 = int(round((min(100.0, cov_pct) / 100.0) * 360.0 * 16))
+                        arc_col = QColor("#4ADE80") if cov_pct >= 80.0 else QColor("#E5C983")
+                        painter.setPen(QPen(arc_col, 2.2))
+                        painter.setBrush(Qt.BrushStyle.NoBrush if hasattr(Qt, "BrushStyle") else Qt.NoBrush)
+                        painter.drawArc(QRectF(asx - 11.5, asy - 11.5, 23.0, 23.0), 90 * 16, -span_16)
 
                     # Center solid gold anchor pin
                     painter.setPen(QPen(QColor("#FCFBF8"), 1.2))
@@ -2725,9 +3036,10 @@ class RealityCaptureMapCanvas(QFrame):
                     painter.drawEllipse(QPointF(asx, asy), 4.0, 4.0)
 
                     # Dark glass label badge with gold border
-                    badge_w = 34
+                    txt_lbl = f"{label}·{int(cov_pct)}%" if cov_pct > 0.5 else label
+                    badge_w = max(34, len(txt_lbl) * 6 + 10)
                     badge_h = 16
-                    bx = asx + 8
+                    bx = asx + 9
                     by = asy - 18
                     painter.setPen(QPen(QColor(186, 161, 100, 180), 1))
                     painter.setBrush(QBrush(QColor(26, 29, 36, 215)))
@@ -2738,7 +3050,7 @@ class RealityCaptureMapCanvas(QFrame):
                     painter.drawText(
                         QRectF(bx, by, badge_w, badge_h),
                         Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter,
-                        label,
+                        txt_lbl,
                     )
 
             # 3. Local Location & Heading Arrow (Champagne Gold #BAA164 with Crisp White Rim)
@@ -2806,6 +3118,182 @@ class RealityCaptureMapCanvas(QFrame):
             painter.end()
 
 
+class PanoramaPreviewDialog(QDialog):
+    """
+    Apple Glass White & Gold 360° Equirectangular Panorama & Coverage Provenance Viewer (Milestone M15).
+    Allows field verification of synthesized Virtual Scan Stations before or after E57 export:
+      - 360° Panorama RGB (unobserved pixels shown cleanly without fabrication)
+      - Coverage Provenance Mask (Photo RGB = Gold, PointCloud RGB = Cyan, Fill = Green, Geometry-Only = Slate, Unobserved = Black)
+      - Range / Depth Heatmap (0..25m Viridis/Turbo falsecolor)
+    """
+
+    def __init__(self, results: List[StationSynthesisResult], parent=None):
+        super().__init__(parent)
+        self.results = list(results or [])
+        self.view_mode = "rgb"
+        self.setWindowTitle("Artificial Vision · AV Structure 360° Station & Panorama Inspector")
+        self.resize(980, 610)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #111318;
+                color: #FCFBF8;
+                border: 1px solid #BAA164;
+            }
+            QLabel { color: #FCFBF8; font-family: 'Inter', Sans-Serif; }
+            QComboBox {
+                background: rgba(255, 255, 255, 0.08);
+                color: #E5C983;
+                border: 1px solid #BAA164;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        # Header Bar
+        hdr = QHBoxLayout()
+        title = QLabel("🌐 AV Structure · Virtual Scan Station & 360° Panorama Inspector")
+        title.setStyleSheet("color: #E5C983; font-size: 13px; font-weight: bold;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+
+        hdr.addWidget(QLabel("Station:"))
+        self.combo_station = QComboBox()
+        for r in self.results:
+            st = r.station
+            self.combo_station.addItem(
+                f"{st.station_id}  ({st.source_mode} | X={st.position_xyz[0]:+.2f}m Y={st.position_xyz[1]:+.2f}m | RGB {r.rgb_coverage_pct:.1f}%)"
+            )
+        self.combo_station.currentIndexChanged.connect(self._refresh_display)
+        hdr.addWidget(self.combo_station)
+        root.addLayout(hdr)
+
+        # Mode Toggle Bar
+        mode_row = QHBoxLayout()
+        self.btn_mode_rgb = QPushButton("🖼 360° Panorama RGB")
+        self.btn_mode_prov = QPushButton("🧭 Coverage Provenance Mask")
+        self.btn_mode_depth = QPushButton("📏 Spherical Depth Map")
+        for b, m in [
+            (self.btn_mode_rgb, "rgb"),
+            (self.btn_mode_prov, "prov"),
+            (self.btn_mode_depth, "depth"),
+        ]:
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda checked, mk=m: self._set_mode(mk))
+            mode_row.addWidget(b)
+        mode_row.addStretch()
+
+        btn_close = QPushButton("Close")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setStyleSheet(
+            "background: rgba(255, 255, 255, 0.08); color: #FCFBF8; border: 1px solid rgba(255, 255, 255, 0.28); "
+            "border-radius: 6px; padding: 4px 14px; font-weight: 600;"
+        )
+        btn_close.clicked.connect(self.accept)
+        mode_row.addWidget(btn_close)
+        root.addLayout(mode_row)
+
+        # Equirectangular Image Viewport
+        self.lbl_image = QLabel("No stations synthesized.")
+        self.lbl_image.setAlignment(Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter)
+        self.lbl_image.setMinimumSize(860, 430)
+        self.lbl_image.setStyleSheet(
+            "background-color: #050608; border: 1px solid rgba(186, 161, 100, 0.55); border-radius: 8px;"
+        )
+        root.addWidget(self.lbl_image, 1)
+
+        # Telemetry & Provenance Legend Footer
+        self.lbl_summary = QLabel("")
+        self.lbl_summary.setFont(QFont("IBM Plex Mono", 9))
+        self.lbl_summary.setStyleSheet("color: #E5C983; padding: 3px 2px;")
+        root.addWidget(self.lbl_summary)
+
+        self._style_mode_buttons()
+        self._refresh_display()
+
+    def _set_mode(self, mode_key: str):
+        self.view_mode = mode_key
+        self._style_mode_buttons()
+        self._refresh_display()
+
+    def _style_mode_buttons(self):
+        for b, m in [
+            (self.btn_mode_rgb, "rgb"),
+            (self.btn_mode_prov, "prov"),
+            (self.btn_mode_depth, "depth"),
+        ]:
+            if m == self.view_mode:
+                b.setStyleSheet(
+                    "background: rgba(186, 161, 100, 0.32); color: #FCFBF8; border: 1px solid #E5C983; "
+                    "border-radius: 6px; padding: 4px 12px; font-size: 10px; font-weight: bold;"
+                )
+            else:
+                b.setStyleSheet(
+                    "background: rgba(255, 255, 255, 0.06); color: rgba(252, 251, 248, 0.78); "
+                    "border: 1px solid rgba(255, 255, 255, 0.20); border-radius: 6px; padding: 4px 12px; font-size: 10px;"
+                )
+
+    def _build_display_rgb(self, res: StationSynthesisResult) -> np.ndarray:
+        if self.view_mode == "rgb":
+            return res.panorama_rgb
+        elif self.view_mode == "prov":
+            prov = res.provenance_mask
+            vis = np.zeros((prov.shape[0], prov.shape[1], 3), dtype=np.uint8)
+            vis[prov == int(PanoramaProvenance.PHOTO_RGB)] = [229, 201, 131]       # Champagne Gold: Calibrated Keyframe Photo
+            vis[prov == int(PanoramaProvenance.POINTCLOUD_RGB)] = [34, 211, 238]   # Electric Cyan: Colorized Point Cloud Splat
+            vis[prov == int(PanoramaProvenance.DEPTH_GUIDED_FILL)] = [74, 222, 128]  # Emerald: Strictly Gated 1px Pinhole Fill
+            vis[prov == int(PanoramaProvenance.GEOMETRY_UNCOLORED)] = [95, 102, 118] # Slate: Uncolored 3D LiDAR Geometry
+            # UNOBSERVED (0) stays pure #000000 black (strictly non-fabricated)
+            return vis
+        else:
+            d = res.panorama_depth_m
+            valid = d > 0.01
+            norm = np.zeros_like(d, dtype=np.uint8)
+            if np.any(valid):
+                d_max = max(2.0, float(np.percentile(d[valid], 98)))
+                norm[valid] = np.clip((d[valid] / d_max) * 255.0, 1, 255).astype(np.uint8)
+            cmap_bgr = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
+            cmap_rgb = cv2.cvtColor(cmap_bgr, cv2.COLOR_BGR2RGB)
+            cmap_rgb[~valid] = [0, 0, 0]
+            return cmap_rgb
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_display()
+
+    def _refresh_display(self):
+        idx = self.combo_station.currentIndex()
+        if idx < 0 or idx >= len(self.results):
+            return
+        res = self.results[idx]
+        rgb_arr = np.ascontiguousarray(self._build_display_rgb(res))
+        h, w, _ = rgb_arr.shape
+        fmt = QImage.Format.Format_RGB888 if hasattr(QImage, "Format") else QImage.Format_RGB888
+        qimg = QImage(rgb_arr.data, w, h, 3 * w, fmt)
+        pix = QPixmap.fromImage(qimg)
+        avail_w = max(320, self.lbl_image.width() - 8)
+        avail_h = max(160, self.lbl_image.height() - 8)
+        aspect = Qt.AspectRatioMode.KeepAspectRatio if hasattr(Qt, "AspectRatioMode") else Qt.KeepAspectRatio
+        smooth = Qt.TransformationMode.SmoothTransformation if hasattr(Qt, "TransformationMode") else Qt.SmoothTransformation
+        self.lbl_image.setPixmap(pix.scaled(avail_w, avail_h, aspect, smooth))
+
+        prov = res.provenance_mask
+        tot = max(1, prov.size)
+        photo_pct = float(np.count_nonzero(prov == int(PanoramaProvenance.PHOTO_RGB))) * 100.0 / tot
+        pc_pct = float(np.count_nonzero(prov == int(PanoramaProvenance.POINTCLOUD_RGB))) * 100.0 / tot
+        unobs_pct = float(np.count_nonzero(prov == int(PanoramaProvenance.UNOBSERVED))) * 100.0 / tot
+        self.lbl_summary.setText(
+            f"Structured Grid: {res.scan_cols}×{res.scan_rows} ({res.valid_scan_points:,} valid rays, {res.scan_coverage_pct:.1f}%)  |  "
+            f"Pano {w}×{h}: Photo={photo_pct:.1f}% · CloudSplat={pc_pct:.1f}% · Unobserved(Preserved)={unobs_pct:.1f}%  |  "
+            f"Keyframes Used: {res.contributing_keyframes} ({res.synthesis_time_ms:.0f}ms)"
+        )
+
+
 class ScanHUBOS(QWidget):
     """
     Main Reality Capture OS Window for scanarMini Rig.
@@ -2827,13 +3315,13 @@ class ScanHUBOS(QWidget):
         self._drag_offset = None
         # Default glass opacity is ultra-transparent 12% for maximum visibility when walking in AR glasses
         self.glass_opacity_pct = 12
-        self.projects_root = "/home/scanar/scanarMini/projects"
-        self.legacy_data_root = "/home/scanar/scanarMini/data"
+        self.projects_root = os.path.join(_WS_DIR, "projects")
+        self.legacy_data_root = os.path.join(_WS_DIR, "data")
         os.makedirs(os.path.join(self.projects_root, "Default_Project", "datasets"), exist_ok=True)
         self.active_project_name = "Default_Project"
         self.active_dataset_name = f"Dataset_{datetime.now().strftime('%m%d_%H%M')}"
 
-        self.diag_recorder = DiagnosticRecorder(base_dir="/home/scanar/scanarMini/diagnostics") if DiagnosticRecorder else None
+        self.diag_recorder = DiagnosticRecorder(base_dir=os.path.join(_WS_DIR, "diagnostics")) if DiagnosticRecorder else None
         self.ros_worker = Ros2BridgeWorker(diag_recorder=self.diag_recorder)
 
         # Elapsed Timer
@@ -3453,6 +3941,7 @@ class ScanHUBOS(QWidget):
 
         self.map_canvas = RealityCaptureMapCanvas()
         self.map_canvas.setMinimumHeight(222)
+        self.map_canvas.station_placed_on_map.connect(self.on_map_station_right_clicked)
         right_layout.addWidget(self.map_canvas, 1)
 
         # ─────────────────────────────────────────────────────────────────────
@@ -3613,7 +4102,9 @@ class ScanHUBOS(QWidget):
         self.btn_m12_commit.clicked.connect(self.on_m12_commit_clicked)
 
         self.combo_m12_fmt = QComboBox()
-        self.combo_m12_fmt.addItems(["PLY_BINARY", "PLY_ASCII", "PCD_BINARY", "PCD_ASCII", "XYZ_ASCII", "OBJ_MESH"])
+        self.combo_m12_fmt.addItems([
+            "PLY_BINARY", "PLY_ASCII", "PCD_BINARY", "PCD_ASCII", "XYZ_ASCII", "OBJ_MESH", "E57_STRUCTURED"
+        ])
         self.combo_m12_fmt.setStyleSheet(
             "background: rgba(255, 255, 255, 0.07); color: #FCFBF8; border: 1px solid rgba(186, 161, 100, 0.45); border-radius: 6px; font-size: 9px; padding: 2px 6px;"
         )
@@ -3821,6 +4312,141 @@ class ScanHUBOS(QWidget):
         gate_tab_layout.addWidget(self.lbl_elevation_stats)
 
         self.hud_tabs.addTab(tab_gate, "⚙ Depth · Telemetry")
+
+        # === TAB 4: M15 VIRTUAL STATIONS, STRUCTURED SCANS & PANORAMAS (AV STRUCTURE) ===
+        tab_m15 = QWidget()
+        m15_layout = QVBoxLayout(tab_m15)
+        m15_layout.setSpacing(5)
+        m15_layout.setContentsMargins(8, 8, 8, 8)
+
+        m15_row1 = QHBoxLayout()
+        lbl_m15_mode = QLabel("Mode:")
+        lbl_m15_mode.setStyleSheet("color: rgba(252, 251, 248, 0.78); font-size: 9px;")
+        self.combo_m15_mode = QComboBox()
+        self.combo_m15_mode.addItems([
+            "Hybrid (Flash + Auto)",
+            "Flash / Manual Only",
+            "Auto Trajectory",
+        ])
+        self.combo_m15_mode.setStyleSheet(
+            "background: rgba(255, 255, 255, 0.07); color: #FCFBF8; border: 1px solid rgba(186, 161, 100, 0.45); border-radius: 6px; font-size: 9px; padding: 2px 6px;"
+        )
+        self.combo_m15_mode.currentIndexChanged.connect(self.sync_m15_config_from_ui)
+
+        lbl_m15_space = QLabel("Step:")
+        lbl_m15_space.setStyleSheet("color: rgba(252, 251, 248, 0.78); font-size: 9px;")
+        self.spin_m15_spacing = QDoubleSpinBox()
+        self.spin_m15_spacing.setRange(1.0, 25.0)
+        self.spin_m15_spacing.setSingleStep(0.5)
+        self.spin_m15_spacing.setDecimals(1)
+        self.spin_m15_spacing.setSuffix("m")
+        self.spin_m15_spacing.setValue(3.5)
+        self.spin_m15_spacing.setStyleSheet(spin_style)
+        self.spin_m15_spacing.valueChanged.connect(self.sync_m15_config_from_ui)
+
+        lbl_m15_res = QLabel("Pano:")
+        lbl_m15_res.setStyleSheet("color: rgba(252, 251, 248, 0.78); font-size: 9px;")
+        self.combo_m15_res = QComboBox()
+        self.combo_m15_res.addItems(["2048×1024", "4096×2048"])
+        self.combo_m15_res.setStyleSheet(
+            "background: rgba(255, 255, 255, 0.07); color: #E5C983; border: 1px solid rgba(186, 161, 100, 0.45); border-radius: 6px; font-size: 9px; padding: 2px 6px;"
+        )
+        self.combo_m15_res.currentIndexChanged.connect(self.sync_m15_config_from_ui)
+
+        m15_row1.addWidget(lbl_m15_mode)
+        m15_row1.addWidget(self.combo_m15_mode, 1)
+        m15_row1.addWidget(lbl_m15_space)
+        m15_row1.addWidget(self.spin_m15_spacing)
+        m15_row1.addWidget(lbl_m15_res)
+        m15_row1.addWidget(self.combo_m15_res)
+        m15_layout.addLayout(m15_row1)
+
+        m15_row2 = QHBoxLayout()
+        lbl_kf_d = QLabel("RGB Trigger Δd:")
+        lbl_kf_d.setStyleSheet("color: rgba(252, 251, 248, 0.78); font-size: 9px;")
+        self.spin_m15_kf_dist = QDoubleSpinBox()
+        self.spin_m15_kf_dist.setRange(0.25, 2.50)
+        self.spin_m15_kf_dist.setSingleStep(0.05)
+        self.spin_m15_kf_dist.setDecimals(2)
+        self.spin_m15_kf_dist.setSuffix("m")
+        self.spin_m15_kf_dist.setValue(0.65)
+        self.spin_m15_kf_dist.setStyleSheet(spin_style)
+        self.spin_m15_kf_dist.valueChanged.connect(self.sync_m15_config_from_ui)
+
+        lbl_kf_r = QLabel("Δθ:")
+        lbl_kf_r.setStyleSheet("color: rgba(252, 251, 248, 0.78); font-size: 9px;")
+        self.spin_m15_kf_rot = QDoubleSpinBox()
+        self.spin_m15_kf_rot.setRange(5.0, 45.0)
+        self.spin_m15_kf_rot.setSingleStep(2.5)
+        self.spin_m15_kf_rot.setDecimals(1)
+        self.spin_m15_kf_rot.setSuffix("°")
+        self.spin_m15_kf_rot.setValue(17.5)
+        self.spin_m15_kf_rot.setStyleSheet(spin_style)
+        self.spin_m15_kf_rot.valueChanged.connect(self.sync_m15_config_from_ui)
+
+        self.chk_m15_gap_fill = QCheckBox("Gated <8cm Fill")
+        self.chk_m15_gap_fill.setChecked(True)
+        self.chk_m15_gap_fill.setToolTip("Strictly depth-gated 1px pinhole fill; unobserved regions NEVER fabricated")
+        self.chk_m15_gap_fill.setStyleSheet("color: #FCFBF8; font-size: 9px;")
+        self.chk_m15_gap_fill.toggled.connect(self.sync_m15_config_from_ui)
+
+        m15_row2.addWidget(lbl_kf_d)
+        m15_row2.addWidget(self.spin_m15_kf_dist)
+        m15_row2.addWidget(lbl_kf_r)
+        m15_row2.addWidget(self.spin_m15_kf_rot)
+        m15_row2.addStretch()
+        m15_row2.addWidget(self.chk_m15_gap_fill)
+        m15_layout.addLayout(m15_row2)
+
+        m15_act = QHBoxLayout()
+        self.btn_m15_drop = QPushButton("⚡ Drop Station")
+        self.btn_m15_drop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_m15_drop.setToolTip("Place virtual station at current pose (or Right-Click anywhere on 2D map)")
+        self.btn_m15_drop.setStyleSheet(
+            "QPushButton { background: rgba(186, 161, 100, 0.18); color: #E5C983; border: 1px solid #BAA164; font-size: 9px; font-weight: 600; padding: 4px 7px; border-radius: 6px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.34); color: #FFFFFF; }"
+        )
+        self.btn_m15_drop.clicked.connect(self.on_m15_drop_station_clicked)
+
+        self.btn_m15_synth = QPushButton("✦ Synthesize Panos")
+        self.btn_m15_synth.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_m15_synth.setStyleSheet(
+            "QPushButton { background: rgba(186, 161, 100, 0.32); color: #FCFBF8; border: 1px solid #E5C983; font-size: 9px; font-weight: 600; padding: 4px 8px; border-radius: 6px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.48); }"
+        )
+        self.btn_m15_synth.clicked.connect(self.on_m15_synthesize_clicked)
+
+        self.btn_m15_preview = QPushButton("👁 Preview 360°")
+        self.btn_m15_preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_m15_preview.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.08); color: #FCFBF8; border: 1px solid rgba(255, 255, 255, 0.24); font-size: 9px; font-weight: 600; padding: 4px 7px; border-radius: 6px; }"
+            "QPushButton:hover { background: rgba(255, 255, 255, 0.18); }"
+        )
+        self.btn_m15_preview.clicked.connect(self.on_m15_preview_pano_clicked)
+
+        self.btn_m15_export = QPushButton("📦 Export .E57")
+        self.btn_m15_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_m15_export.setStyleSheet(
+            "QPushButton { background: rgba(255, 255, 255, 0.12); color: #E5C983; border: 1px solid #FCFBF8; font-size: 9px; font-weight: 600; padding: 4px 7px; border-radius: 6px; }"
+            "QPushButton:hover { background: rgba(186, 161, 100, 0.30); color: #FFFFFF; }"
+        )
+        self.btn_m15_export.clicked.connect(self.on_m15_export_e57_clicked)
+
+        m15_act.addWidget(self.btn_m15_drop)
+        m15_act.addWidget(self.btn_m15_synth)
+        m15_act.addWidget(self.btn_m15_preview)
+        m15_act.addWidget(self.btn_m15_export)
+        m15_layout.addLayout(m15_act)
+
+        self.lbl_m15_status = QLabel(
+            "AV Structure Ready · Keyframes: 0 | Stations: 0 (Right-click Map or press [F] Flash)"
+        )
+        self.lbl_m15_status.setStyleSheet(
+            "color: #E5C983; font-size: 9px; font-family: 'IBM Plex Mono', Monospace; font-weight: 600;"
+        )
+        m15_layout.addWidget(self.lbl_m15_status)
+
+        self.hud_tabs.addTab(tab_m15, "🌐 Stations · Pano")
         right_layout.addWidget(self.hud_tabs)
 
         # 5. Translucent Apple Glass Studio Log Card
@@ -3835,6 +4461,7 @@ class ScanHUBOS(QWidget):
         self.console.append("[AR PASSTHROUGH] Frameless translucent window + transparent Min/Max/Close controls active.")
         self.console.append("[M12 CLEANUP] Post-processing mode default (Real-time filter OFF for zero-lag 10Hz/20Hz streaming).")
         self.console.append("[C-SLAM] Unlimited Multi-Scanner Engine ONLINE (UDP Port 19440 | Non-Overlap IMU+Offset -> Auto Overlap Snap).")
+        self.console.append("[M15 AV STRUCTURE] Virtual Scan Stations + 360° Panoramas + ASTM E2807-11 Structured E57 Ready.")
         right_layout.addWidget(self.console, 1)
 
         splitter.addWidget(right_container)
@@ -4174,7 +4801,7 @@ class ScanHUBOS(QWidget):
         self.ros_worker.dispatch_live_map_and_telemetry(force=True)
 
     def refresh_projects_hub_lists(self):
-        """Scans /home/scanar/scanarMini/projects (plus Legacy_Scans in data/) and populates the Projects & Datasets lists."""
+        """Scans /home/scanar/AV ScanAR/projects (plus Legacy_Scans in data/) and populates the Projects & Datasets lists."""
         os.makedirs(self.projects_root, exist_ok=True)
         os.makedirs(os.path.join(self.projects_root, "Default_Project", "datasets"), exist_ok=True)
 
@@ -4190,7 +4817,7 @@ class ScanHUBOS(QWidget):
         if "Default_Project" not in projects:
             projects.insert(0, "Default_Project")
 
-        # Also surface existing scans in /home/scanar/scanarMini/data as Legacy_Scans
+        # Also surface existing scans in /home/scanar/AV ScanAR/data as Legacy_Scans
         if os.path.isdir(self.legacy_data_root):
             try:
                 legacy_items = [
@@ -4571,6 +5198,7 @@ class ScanHUBOS(QWidget):
             "PCD_ASCII": "pcd",
             "XYZ_ASCII": "xyz",
             "OBJ_MESH": "obj",
+            "E57_STRUCTURED": "e57",
         }
         ext = ext_map.get(fmt_str, "ply")
         dataset = self.dataset_input.text().strip().replace(" ", "_") or "Scan"
@@ -4712,14 +5340,14 @@ class ScanHUBOS(QWidget):
                 pass
 
     def start_ros_stack(self):
-        ws = "/home/scanar/scanarMini"
+        ws = _WS_DIR
         self.console.append("[STACK] Cleaning up any prior nodes, verifying Airy SYNC_OUT1, and launching single-instance ROS 2 Stack...")
         env = os.environ.copy()
         env["ROS_DOMAIN_ID"] = "0"
         env["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
         setup_cmd = (
             f"source /opt/ros/humble/setup.bash && "
-            f"source {ws}/install/setup.bash && "
+            f'source "{ws}/install/setup.bash" && '
             f"export ROS_DOMAIN_ID=0 && "
             f"export RMW_IMPLEMENTATION=rmw_fastrtps_cpp"
         )
@@ -4797,6 +5425,24 @@ class ScanHUBOS(QWidget):
                 self.lbl_m12_status.setText(
                     "M12 RT Filter: OFF (Post-Process Ready — Preview / Commit / Export)"
                 )
+
+        # Update M15 AV Structure Keyframe & Live Station Coverage Readout
+        m15_st_list = t.get("m15_stations", [])
+        if m15_st_list:
+            self.map_canvas.update_station_coverages(m15_st_list)
+        if time.time() >= getattr(self, "_m15_status_hold_until", 0.0):
+            n_kf = int(t.get("m15_keyframes", 0))
+            n_blur = int(t.get("m15_blur_rejected", 0))
+            n_st = len(self.map_canvas.flash_anchors)
+            avg_st_cov = (
+                float(np.mean([s.get("cov_pct", 0.0) for s in m15_st_list]))
+                if m15_st_list
+                else 0.0
+            )
+            cov_tag = f" ({avg_st_cov:.0f}% Azimuth)" if m15_st_list else ""
+            self.lbl_m15_status.setText(
+                f"Keyframes: {n_kf} (Blur Gate: -{n_blur})  |  Stations: {n_st}{cov_tag}"
+            )
 
         # Update C-SLAM Unlimited Multi-Scanner Status
         cslam = t.get("cslam", {})
@@ -5042,10 +5688,166 @@ class ScanHUBOS(QWidget):
         cx = self.map_canvas.current_x
         cy = self.map_canvas.current_y
         cz = getattr(self.ros_worker, "current_z", 0.0)
+        cyaw = self.map_canvas.current_yaw
 
-        self.map_canvas.add_flash_anchor(label, cx, cy, cz)
-        self.console.append(f"[FARO FLASH SCAN] ⚡ Anchor {label} Captured at X={cx:+.2f}m Y={cy:+.2f}m Z={cz:+.2f}m ({timestamp})")
-        self.status_bar.showMessage(f"⚡ FLASH ANCHOR {label} RECORDED at ({cx:+.2f}, {cy:+.2f})", 4000)
+        self.map_canvas.add_flash_anchor(label, cx, cy, cz, yaw=cyaw, source_mode="manual_flash")
+        self.ros_worker.register_live_virtual_station(
+            label=label, x=cx, y=cy, z=cz, yaw=cyaw, source_mode="manual_flash"
+        )
+        self.console.append(
+            f"[FARO FLASH / STATION] ⚡ Virtual Station {label} Anchored at X={cx:+.2f}m Y={cy:+.2f}m Z={cz:+.2f}m ({timestamp}) — Spin 360° for full RGB pano!"
+        )
+        self.status_bar.showMessage(f"⚡ VIRTUAL STATION {label} ANCHORED at ({cx:+.2f}, {cy:+.2f})", 4000)
+
+    def sync_m15_config_from_ui(self):
+        idx = self.combo_m15_mode.currentIndex()
+        if idx == 1:
+            pmode = StationPlacementMode.MANUAL_ONLY
+        elif idx == 2:
+            pmode = StationPlacementMode.AUTO_ONLY
+        else:
+            pmode = StationPlacementMode.HYBRID
+
+        res_txt = self.combo_m15_res.currentText()
+        if "4096" in res_txt:
+            pw, ph, s_rows, s_cols = 4096, 2048, 512, 2048
+        else:
+            pw, ph, s_rows, s_cols = 2048, 1024, 256, 1024
+
+        with self.ros_worker.lock:
+            self.ros_worker.m15_station_config.placement_mode = pmode
+            self.ros_worker.m15_station_config.auto_spacing_m = float(self.spin_m15_spacing.value())
+            self.ros_worker.m15_station_config.pano_width = pw
+            self.ros_worker.m15_station_config.pano_height = ph
+            self.ros_worker.m15_station_config.scan_rows = s_rows
+            self.ros_worker.m15_station_config.scan_cols = s_cols
+            self.ros_worker.m15_station_config.enable_small_gap_fill = bool(self.chk_m15_gap_fill.isChecked())
+            self.ros_worker.keyframe_selector.config.min_distance_m = float(self.spin_m15_kf_dist.value())
+            self.ros_worker.keyframe_selector.config.min_rotation_deg = float(self.spin_m15_kf_rot.value())
+
+    def on_map_station_right_clicked(self, wx: float, wy: float):
+        label = f"m{self.anchor_count:02d}"
+        self.anchor_count += 1
+        cz = getattr(self.ros_worker, "current_z", 0.0)
+        cyaw = self.map_canvas.current_yaw
+        self.map_canvas.add_flash_anchor(label, wx, wy, cz, yaw=cyaw, source_mode="map_marker")
+        st = self.ros_worker.register_live_virtual_station(
+            label=label, x=wx, y=wy, z=cz, yaw=cyaw, source_mode="map_marker"
+        )
+        self._m15_status_hold_until = time.time() + 2.5
+        self.lbl_m15_status.setText(
+            f"Placed Map Station {label} at ({wx:+.2f}m, {wy:+.2f}m) | Azimuth Cov: {st.live_azimuth_coverage_pct:.0f}%"
+        )
+        self.console.append(
+            f"[AV STRUCTURE] 📍 Placed Virtual Scan Station '{label}' on 2D Map at X={wx:+.2f}m Y={wy:+.2f}m"
+        )
+
+    def on_m15_drop_station_clicked(self):
+        label = f"s{self.anchor_count:02d}"
+        self.anchor_count += 1
+        cx = self.map_canvas.current_x
+        cy = self.map_canvas.current_y
+        cz = getattr(self.ros_worker, "current_z", 0.0)
+        cyaw = self.map_canvas.current_yaw
+        self.map_canvas.add_flash_anchor(label, cx, cy, cz, yaw=cyaw, source_mode="manual_flash")
+        st = self.ros_worker.register_live_virtual_station(
+            label=label, x=cx, y=cy, z=cz, yaw=cyaw, source_mode="manual_flash"
+        )
+        self._m15_status_hold_until = time.time() + 2.5
+        self.lbl_m15_status.setText(
+            f"Anchored Station {label} at ({cx:+.2f}m, {cy:+.2f}m) | Azimuth Cov: {st.live_azimuth_coverage_pct:.0f}%"
+        )
+        self.console.append(
+            f"[AV STRUCTURE] ⚡ Dropped Virtual Scan Station '{label}' at X={cx:+.2f}m Y={cy:+.2f}m Z={cz:+.2f}m"
+        )
+
+    def on_m15_synthesize_clicked(self):
+        self.sync_m15_config_from_ui()
+        self._m15_status_hold_until = time.time() + 4.0
+        flash_snap = list(self.map_canvas.flash_anchors)
+        traj_snap = list(self.map_canvas.trajectory_path)
+        t0 = time.perf_counter()
+        results = self.ros_worker.synthesize_virtual_stations(
+            flash_anchors=flash_snap,
+            canvas_trajectory=traj_snap,
+        )
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        if not results:
+            self.lbl_m15_status.setText("No 3D geometry available yet for station synthesis.")
+            return
+        avg_rgb = float(np.mean([r.rgb_coverage_pct for r in results]))
+        avg_scan = float(np.mean([r.scan_coverage_pct for r in results]))
+        self.lbl_m15_status.setText(
+            f"Synthesized {len(results)} Station(s) in {dt_ms:.0f}ms | Scan Cov: {avg_scan:.1f}% | Pano RGB: {avg_rgb:.1f}%"
+        )
+        self.console.append(
+            f"[AV STRUCTURE] ✦ Synthesized {len(results)} Virtual Station(s) ({dt_ms:.0f} ms): "
+            f"Structured Scan Avg={avg_scan:.1f}%, 360° Pano RGB Avg={avg_rgb:.1f}% (Unobserved regions preserved cleanly)."
+        )
+
+    def on_m15_preview_pano_clicked(self):
+        with self.ros_worker.lock:
+            results = list(self.ros_worker.last_station_results)
+        if not results:
+            self.on_m15_synthesize_clicked()
+            with self.ros_worker.lock:
+                results = list(self.ros_worker.last_station_results)
+        if not results:
+            return
+        dlg = PanoramaPreviewDialog(results, parent=self)
+        dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
+
+    def on_m15_export_e57_clicked(self):
+        self.sync_m15_config_from_ui()
+        self._m15_status_hold_until = time.time() + 4.0
+        with self.ros_worker.lock:
+            results = list(self.ros_worker.last_station_results)
+        if not results:
+            results = self.ros_worker.synthesize_virtual_stations(
+                flash_anchors=list(self.map_canvas.flash_anchors),
+                canvas_trajectory=list(self.map_canvas.trajectory_path),
+            )
+        if not results:
+            self.lbl_m15_status.setText("Export aborted: no station geometry available.")
+            return
+
+        dataset = self.dataset_input.text().strip().replace(" ", "_") or self.active_dataset_name
+        save_dir = self._get_active_dataset_save_dir(dataset)
+        os.makedirs(save_dir, exist_ok=True)
+        avproj_root = (
+            os.path.join(self.projects_root, self.active_project_name)
+            if self.active_project_name != "Legacy_Scans"
+            else os.path.join(save_dir, "av_showcase")
+        )
+        with self.ros_worker.lock:
+            a_v, s_v = self.ros_worker._get_voxel_arrays_locked()
+            live_pts = self.ros_worker.extract_raw_3d_points_for_mode("colorized_fused", a_v, s_v)
+        pts_xyz = live_pts[:, :3].astype(np.float64) if len(live_pts) > 0 else None
+        pts_rgb = np.clip(live_pts[:, 3:6], 0, 255).astype(np.uint8) if len(live_pts) > 0 else None
+        info = export_av_structure_bundle(
+            save_dir=save_dir,
+            results=results,
+            export_e57=True,
+            e57_filename="structured_stations.e57",
+            jpeg_quality=self.ros_worker.m15_station_config.jpeg_quality,
+            points_xyz=pts_xyz,
+            points_rgb=pts_rgb,
+            project_name=self.active_project_name,
+            scan_id=dataset,
+            av_showcase_project_dir=avproj_root,
+        )
+        e57_path = info.get("structured_e57_path") or (
+            os.path.join(save_dir, info["structured_e57_file"]) if info.get("structured_e57_file") else ""
+        )
+        kb = os.path.getsize(e57_path) // 1024 if e57_path and os.path.exists(e57_path) else 0
+        fl_cnt = int(info.get("floor_count", 1))
+        self.lbl_m15_status.setText(
+            f"Exported {len(results)} Station(s), {fl_cnt} Floor(s) -> E57 + AV Bundle + .avproj ({kb:,} KB)"
+        )
+        self.console.append(
+            f"[AV ECOSYSTEM] 📦 Exported {len(results)} Station(s) ({fl_cnt} Floor(s)) -> {e57_path}, "
+            f"av_walkthrough_bundle.json, keyplans & {info.get('av_showcase_avproj_path')}"
+        )
 
     def update_scan_clock_tick(self):
         self.scan_elapsed_seconds += 1
@@ -5100,7 +5902,7 @@ class ScanHUBOS(QWidget):
                     trajectory=traj_snap,
                     flash_anchors=flash_snap,
                 )
-                # Maintain a symlink in /home/scanar/scanarMini/data/<dataset> if saved under projects/
+                # Maintain a symlink in /home/scanar/AV ScanAR/data/<dataset> if saved under projects/
                 try:
                     os.makedirs(self.legacy_data_root, exist_ok=True)
                     if os.path.abspath(save_dir) != os.path.abspath(legacy_dir) and not os.path.exists(legacy_dir):
@@ -5135,6 +5937,14 @@ class ScanHUBOS(QWidget):
         self.console.append(f"  - pointcloud_fused_rgb.ply / .pcd: {n_f:,} pts (Truecolor Fused)")
         if n_p > 0:
             self.console.append(f"  - pointcloud_cslam_merged.ply: {n_c:,} pts ({1 + n_p} Scanners Merged)")
+        n_kf = meta.get("rgb_keyframes_saved", 0)
+        n_vs = meta.get("virtual_stations_count", 0)
+        if n_kf > 0:
+            self.console.append(f"  - keyframes/: {n_kf} Calibrated Posed RGB Keyframes (keyframes_manifest.json)")
+        if n_vs > 0:
+            self.console.append(
+                f"  - structured_stations.e57 + stations/: {n_vs} Virtual Scan Station(s) (Structured 3D + 360° Panoramas)"
+            )
         self.console.append("  - trajectory.csv / trajectory_tum.txt")
         self.console.append("  - scan_metadata.json")
         self.progress_label.setText(f"DATASET SAVED: {save_dir}")

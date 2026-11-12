@@ -49,10 +49,11 @@ To prevent spatial distortion and preserve geometric integrity, the architecture
 | **M9** | Timing & Sync Qualification | Hardware strobe signal measurement, Airy Pin 2 -> Gemini Pin 6 VSYNC trigger lock. | ✅ Complete |
 | **M10** | Pure Airy LIO SLAM Suite | Pure Airy LiDAR + Airy IMU FAST-LIVO2 state estimation (frontend drift < 2.0%). | ✅ Complete |
 | **M11** | GUI ↔ SLAM Physical Workflow | Real-time map canvas, 1:1 motion vector lock, Flash Scans & dataset persistence. | ✅ Complete |
-| **M12** | **Point Cloud RGB Colorization & Visual Fusion** | **Projection validation ($T_{\text{RGB}\leftarrow\text{LiDAR}}$) on sharp edges, visual patch tracking in FAST-LIVO2.** | 🔴 **CURRENT** |
+| **M12** | **Point Cloud RGB Colorization, Cleanup & Unlimited C-SLAM** | **Projection validation ($T_{\text{RGB}\leftarrow\text{LiDAR}}$), M12 Voxel/SOR/ROR/RANSAC Ground Leveling, Unlimited-Peer UDP C-SLAM.** | ✅ Complete |
 | **M13** | Independent Visual Tracking | Stereo IR + IMU visual odometry verification under aggressive LiDAR-degraded motion. | 🔴 Scheduled |
 | **M14** | Multi-Session Loop Closure & Export | Automated session management, backend loop closure, LAS/E57/PLY production export. | 🔴 Scheduled |
-| **M15** | Commercial MVP Acceptance | Repeatable physical testing: static drift, 5m scale, 90° rotation, square loop closure. | 🔴 Scheduled |
+| **M15** | **Virtual Stations, Structured Scans & Panoramas (`AV Structure`)** | **Shared-center virtual scan stations, structured spherical 3D scans, multi-view RGB keyframe 360° panoramas, ASTM E2807-11 Structured `.e57` export.** | ✅ Complete |
+| **M15B** | Commercial MVP Acceptance | Repeatable physical testing: static drift, 5m scale, 90° rotation, square loop closure. | 🔴 **CURRENT** |
 
 ---
 
@@ -116,6 +117,37 @@ To prevent spatial distortion and preserve geometric integrity, the architecture
   * Left IR (`/cam0/image_raw` @ 30 Hz)
   * Right IR (`/cam1/image_raw` @ 30 Hz)
 * Benchmark CPU load, RAM usage, zero-drop packet transport, and timestamp continuity.
+
+---
+
+## Milestone M15: Virtual Stations, Structured Scans & Panoramas (`AV Structure`) [COMPLETE]
+
+Transforms continuous mobile LiDAR + RGB reality capture (and third-party point clouds) into navigable terrestrial-grade **Virtual Scan Stations** for `AV Scan`, `AV Walkthrough`, and downstream BIM/CAD tools (Autodesk ReCap, CloudCompare, Revit, Faro Scene) without requiring a dedicated 360° camera.
+
+### M15.1 — Intelligent Multi-Trigger RGB Keyframe Capture
+* Continuous full-resolution RGB keyframe selection (`keyframes/kf_XXXX.jpg` + `keyframes_manifest.json`) driven by:
+  * **Translation Trigger**: Every $0.5\text{–}1.0\text{ m}$ of trajectory motion (default $0.65\text{ m}$).
+  * **Rotation Trigger**: Every $15\text{–}20^\circ$ of 3D camera rotation (default $17.5^\circ$; $12^\circ$ near anchored stations for smooth $360^\circ$ station spins).
+  * **Directional Coverage Trigger**: Captures previously unobserved world azimuth $\times$ elevation sectors.
+  * **Quality Gate**: Laplacian variance sharpness check + luma exposure check to reject motion-blurred or washed-out frames.
+  * **Post-SLAM Pose Refinement**: Re-interpolates camera poses (`SLERP` + linear) against final SLAM trajectory prior to synthesis.
+
+### M15.2 — Virtual Scan Station Placement (3 Modes)
+* **Manual / Flash Anchors (`MANUAL_ONLY`)**: Triggered live via `[F] FARO FLASH`, `⚡ Drop Station`, or right-clicking any world coordinate on the 2D Map Canvas (with live $360^\circ$ RGB azimuth coverage ring).
+* **Automatic Trajectory Stations (`AUTO_ONLY`)**: Placed along trajectory at configurable spacing (default $3.5\text{ m}$), locally scored for RGB keyframe coverage.
+* **Hybrid Mode (`HYBRID`, Default)**: Anchors all manual/Flash stations first, then fills uncovered trajectory spans automatically while maintaining clearance.
+
+### M15.3 — Shared-Center Dual Output Synthesis & Non-Fabrication Rule
+* **Structured Spherical 3D Scan** (`rows × cols`, e.g. $256 \times 1024$ or $512 \times 2048$): Gravity-leveled station frame with foreground Z-buffer occlusion culling and explicit `cartesianInvalidState` (`0` = valid measurement, `2` = unobserved/occluded).
+* **$360^\circ$ Equirectangular Panorama** ($2048 \times 1024$ / $4096 \times 2048$):
+  * **Primary Path**: Geometry-assisted multi-view reprojection of calibrated Plumb-Bob (`Orbbec Gemini 336L`) or spherical (`Ouster Rev8`) keyframes onto visible 3D surfaces with per-keyframe Z-buffer parallax occlusion testing and vignette/baseline/sharpness feathering.
+  * **Fallback Path**: Range-adaptive surfel splatting directly from colorized point clouds (`pointcloud_fused_rgb.ply` or third-party `.ply`/`.xyz`).
+* **Strict Reality-Capture Integrity**: Unobserved or missing regions are **never** AI-inpainted or fabricated—preserved explicitly as `PanoramaProvenance.UNOBSERVED` (`0`) and `cartesianInvalidState = 2`.
+
+### M15.4 — ASTM E2807-11 Structured `.e57` & Station Bundle Export
+* Zero-dependency binary ASTM E2807-11 writer and Castagnoli CRC-32C page validator (`src/scanhub_gui/e57_structured_writer.py`).
+* Pairs each station's `data3D` structured spherical scan with its aligned `images2D` `sphericalRepresentation` JPEG panorama via `associatedData3DGuid`.
+* Exports standalone `stations/<station_id>/` bundle (`panorama_rgb.jpg`, `depth_map_mm.png`, `coverage_mask.png`, `structured_scan.ply`, `station_metadata.json`, `stations_manifest.json`) and reusable CLI `scripts/generate_virtual_stations.py`.
 
 ---
 
